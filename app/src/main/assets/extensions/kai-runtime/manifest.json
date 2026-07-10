@@ -1,0 +1,30 @@
+{
+  "manifest_version": 2,
+  "name": "Kai Runtime Bridge",
+  "version": "0.2.1",
+  "description": "Injects the KaiOS compatibility layer and connects it to Android.",
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "kai-runtime@example.com"
+    }
+  },
+  "permissions": [
+    "nativeMessaging",
+    "nativeMessagingFromContent",
+    "geckoViewAddons",
+    "<all_urls>"
+  ],
+  "background": {
+    "scripts": ["background.js"]
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    "page-runtime.js"
+  ]
+}
