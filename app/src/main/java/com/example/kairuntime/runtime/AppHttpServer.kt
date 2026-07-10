@@ -4,14 +4,27 @@ import java.io.BufferedReader
 import java.io.Closeable
 import java.io.File
 import java.io.InputStreamReader
+import java.io.RandomAccessFile
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
 import java.util.concurrent.Executors
 
+/**
+ * Loopback-only static file server for a single installed KaiOS package.
+ *
+ * The server intentionally exposes only files below [root]. It injects the runtime
+ * bridge script into HTML documents and serves a synthetic script at
+ * [HttpAssets.RUNTIME_SCRIPT_PATH]. Correct MIME typing matters because GeckoView
+ * enforces `X-Content-Type-Options: nosniff`: a script served as `text/plain` is
+ * refused, which is the failure that broke real KaiOS apps (e.g. `common/js/cache.js`).
+ *
+ * Byte-range requests are supported so audio/video seeking works, and directory
+ * requests fall back to `index.html`.
+ */
 class AppHttpServer(private val root: File, port: Int, private val runtimeScript: ByteArray) : Closeable {
-    private val server = ServerSocket(port, 16, InetAddress.getByName("127.0.0.1"))
+    private val server = ServerSocket(port, 32, InetAddress.getByName("127.0.0.1"))
     private val workers = Executors.newCachedThreadPool()
     @Volatile private var running = true
 
@@ -29,70 +42,148 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
     }
 
     private fun handle(socket: Socket) = socket.use { client ->
-        client.soTimeout = 5_000
+        client.soTimeout = 15_000
+        client.tcpNoDelay = true
         val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.US_ASCII))
-        val request = reader.readLine()?.split(' ') ?: return@use
-        if (request.size < 2 || request[0] !in setOf("GET", "HEAD")) {
-            respond(client, 405, "text/plain", "Method not allowed".toByteArray(), request.firstOrNull() == "HEAD")
+        val requestLine = reader.readLine() ?: return@use
+        if (requestLine.length > MAX_REQUEST_LINE) {
+            respond(client, 414, "text/plain; charset=utf-8", "URI too long".toByteArray(), false)
             return@use
         }
-        while (!reader.readLine().isNullOrEmpty()) Unit
+        val request = requestLine.split(' ')
+        val method = request.firstOrNull()?.uppercase().orEmpty()
+        val headOnly = method == "HEAD"
+
+        // Read request headers (retaining Range) with a bound to avoid abuse.
+        var rangeHeader: String? = null
+        var headerCount = 0
+        while (true) {
+            val line = reader.readLine()
+            if (line.isNullOrEmpty()) break
+            if (++headerCount > MAX_HEADERS) break
+            if (line.length >= 6 && line.regionMatches(0, "Range:", 0, 6, ignoreCase = true)) {
+                rangeHeader = line.substring(6).trim()
+            }
+        }
+
+        if (method == "OPTIONS") {
+            respondOptions(client)
+            return@use
+        }
+        if (method != "GET" && method != "HEAD") {
+            respond(client, 405, "text/plain; charset=utf-8", "Method not allowed".toByteArray(), false)
+            return@use
+        }
+        if (request.size < 2) {
+            respond(client, 400, "text/plain; charset=utf-8", "Bad request".toByteArray(), headOnly)
+            return@use
+        }
 
         val rawPath = request[1].substringBefore('?').substringBefore('#')
         val decoded = runCatching { URLDecoder.decode(rawPath, "UTF-8") }.getOrElse {
-            respond(client, 400, "text/plain", "Bad request".toByteArray(), request[0] == "HEAD")
+            respond(client, 400, "text/plain; charset=utf-8", "Bad request".toByteArray(), headOnly)
             return@use
         }
         val relative = decoded.removePrefix("/").ifBlank { "index.html" }
-        if (relative == RUNTIME_SCRIPT_PATH) {
-            respond(client, 200, "text/javascript; charset=utf-8", runtimeScript, request[0] == "HEAD")
+        if (relative == HttpAssets.RUNTIME_SCRIPT_PATH) {
+            respond(client, 200, "text/javascript; charset=utf-8", runtimeScript, headOnly)
             return@use
         }
-        val file = File(root, relative).canonicalFile
-        val safeRoot = root.canonicalFile
-        if (!file.path.startsWith(safeRoot.path + File.separator) || !file.isFile) {
-            respond(client, 404, "text/plain", "Not found".toByteArray(), request[0] == "HEAD")
+
+        val resolved = HttpAssets.resolveFile(root, relative)
+        if (resolved == null) {
+            respond(client, 404, "text/plain; charset=utf-8", "Not found".toByteArray(), headOnly)
             return@use
         }
-        val body = if (file.extension.equals("html", true) || file.extension.equals("htm", true)) {
-            injectRuntime(file.readText(Charsets.UTF_8)).toByteArray(Charsets.UTF_8)
-        } else {
-            file.readBytes()
+
+        // HTML documents are rewritten to inject the runtime bridge; they never
+        // participate in range requests because their length changes on the fly.
+        if (HttpAssets.isHtml(resolved)) {
+            val body = HttpAssets.injectRuntime(resolved.readText(Charsets.UTF_8)).toByteArray(Charsets.UTF_8)
+            respond(client, 200, HttpAssets.mimeType(resolved), body, headOnly)
+            return@use
         }
-        respond(client, 200, mimeType(file), body, request[0] == "HEAD")
+
+        serveFile(client, resolved, rangeHeader, headOnly)
     }
 
-    private fun injectRuntime(html: String): String {
-        val tag = "<script src=\"/$RUNTIME_SCRIPT_PATH\"></script>"
-        val head = Regex("<head(?:\\s[^>]*)?>", RegexOption.IGNORE_CASE).find(html)
-        return if (head != null) html.replaceRange(head.range.last + 1, head.range.last + 1, tag)
-        else tag + html
+    private fun serveFile(client: Socket, file: File, rangeHeader: String?, headOnly: Boolean) {
+        val length = file.length()
+        val type = HttpAssets.mimeType(file)
+        val range = rangeHeader?.let { HttpAssets.parseRange(it, length) }
+        if (range != null) {
+            val (start, end) = range
+            val count = end - start + 1
+            val extraHeaders = "Content-Range: bytes $start-$end/$length\r\nAccept-Ranges: bytes\r\n"
+            writeHeaders(client, 206, type, count, extraHeaders)
+            if (!headOnly) {
+                RandomAccessFile(file, "r").use { raf ->
+                    raf.seek(start)
+                    streamBytes(client, raf, count)
+                }
+            }
+        } else {
+            writeHeaders(client, 200, type, length, "Accept-Ranges: bytes\r\n")
+            if (!headOnly) {
+                RandomAccessFile(file, "r").use { raf -> streamBytes(client, raf, length) }
+            }
+        }
+        client.getOutputStream().flush()
+    }
+
+    private fun streamBytes(client: Socket, raf: RandomAccessFile, count: Long) {
+        val output = client.getOutputStream()
+        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+        var remaining = count
+        while (remaining > 0) {
+            val toRead = minOf(remaining, buffer.size.toLong()).toInt()
+            val read = raf.read(buffer, 0, toRead)
+            if (read < 0) break
+            output.write(buffer, 0, read)
+            remaining -= read
+        }
+    }
+
+    private fun respondOptions(client: Socket) {
+        val output = client.getOutputStream()
+        output.write(
+            ("HTTP/1.1 204 No Content\r\n" +
+                "Allow: GET, HEAD, OPTIONS\r\n" +
+                "Accept-Ranges: bytes\r\n" +
+                "Content-Length: 0\r\n" +
+                "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII),
+        )
+        output.flush()
     }
 
     private fun respond(socket: Socket, status: Int, type: String, body: ByteArray, headOnly: Boolean) {
-        val reason = when (status) { 200 -> "OK"; 400 -> "Bad Request"; 404 -> "Not Found"; else -> "Method Not Allowed" }
+        writeHeaders(socket, status, type, body.size.toLong(), "")
         val output = socket.getOutputStream()
-        output.write("HTTP/1.1 $status $reason\r\nContent-Type: $type\r\nContent-Length: ${body.size}\r\nCache-Control: no-cache\r\nX-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n".toByteArray(Charsets.US_ASCII))
         if (!headOnly) output.write(body)
         output.flush()
     }
 
-    private fun mimeType(file: File): String = when (file.extension.lowercase()) {
-        "html", "htm" -> "text/html; charset=utf-8"
-        "css" -> "text/css; charset=utf-8"
-        "js", "mjs" -> "text/javascript; charset=utf-8"
-        "json", "webapp" -> "application/json; charset=utf-8"
-        "svg" -> "image/svg+xml"
-        "png" -> "image/png"
-        "jpg", "jpeg" -> "image/jpeg"
-        "gif" -> "image/gif"
-        "webp" -> "image/webp"
-        "mp3" -> "audio/mpeg"
-        "ogg" -> "audio/ogg"
-        "mp4" -> "video/mp4"
-        "woff" -> "font/woff"
-        "woff2" -> "font/woff2"
-        else -> "application/octet-stream"
+    private fun writeHeaders(socket: Socket, status: Int, type: String, contentLength: Long, extraHeaders: String) {
+        val header = buildString {
+            append("HTTP/1.1 ").append(status).append(' ').append(reasonPhrase(status)).append("\r\n")
+            append("Content-Type: ").append(type).append("\r\n")
+            append("Content-Length: ").append(contentLength).append("\r\n")
+            append("Cache-Control: no-cache\r\n")
+            append("X-Content-Type-Options: nosniff\r\n")
+            if (extraHeaders.isNotEmpty()) append(extraHeaders)
+            append("Connection: close\r\n\r\n")
+        }
+        socket.getOutputStream().write(header.toByteArray(Charsets.US_ASCII))
+    }
+
+    private fun reasonPhrase(status: Int): String = when (status) {
+        200 -> "OK"
+        206 -> "Partial Content"
+        400 -> "Bad Request"
+        404 -> "Not Found"
+        405 -> "Method Not Allowed"
+        414 -> "URI Too Long"
+        else -> "Error"
     }
 
     override fun close() {
@@ -102,6 +193,7 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
     }
 
     companion object {
-        private const val RUNTIME_SCRIPT_PATH = "__kai_runtime__/page-runtime.js"
+        private const val MAX_REQUEST_LINE = 8_192
+        private const val MAX_HEADERS = 100
     }
 }
