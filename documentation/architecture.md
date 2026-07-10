@@ -10,6 +10,26 @@
 6. The WebExtension injects `page-runtime.js` at document start and forwards messages through GeckoView native messaging.
 7. Native API requests are checked against manifest and Android permissions before execution.
 
+## Static file serving
+
+`AppHttpServer` serves package assets over loopback. Correctness details that
+matter for compatibility:
+
+- Files are typed from an explicit MIME table (`HttpAssets.MIME_TYPES`). This is
+  essential because GeckoView sends `X-Content-Type-Options: nosniff`, so a
+  script served as `text/plain` is refused (the failure mode that broke real
+  KaiOS apps such as `common/js/cache.js`).
+- Directory requests fall back to `index.html`/`index.htm`.
+- `GET`/`HEAD` support single `Range` requests (`206 Partial Content` with
+  `Content-Range`) so audio and video can seek; `Accept-Ranges: bytes` is always
+  advertised.
+- `OPTIONS` returns `204` with an `Allow` header; other methods return `405`.
+- HTML responses are rewritten in memory to inject the runtime bridge script and
+  therefore never participate in range requests.
+
+The pure logic (MIME typing, range parsing, path resolution, script injection)
+lives in `HttpAssets` so it can be unit-tested on the JVM without a live socket.
+
 ## Trust boundaries
 
 - Imported files are untrusted. Canonical paths, extracted byte count, entry count, launch path, and binary extensions are checked.

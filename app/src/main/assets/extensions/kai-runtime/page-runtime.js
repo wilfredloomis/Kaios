@@ -413,6 +413,47 @@
   Object.defineProperty(window, "KaiRuntime", { value: runtime, enumerable: true });
   Object.defineProperty(navigator, "kaiRuntime", { value: runtime, enumerable: true });
 
+  // Promise-based Battery Status API. Some KaiOS apps call navigator.getBattery()
+  // and expect a BatteryManager-like object; back it with the native bridge so the
+  // reported level reflects the real device instead of a static value.
+  if (typeof navigator.getBattery !== "function") {
+    const batteryManager = new EventTarget();
+    let batteryLevel = 1;
+    Object.defineProperties(batteryManager, {
+      charging: { enumerable: true, get: () => true },
+      chargingTime: { enumerable: true, get: () => 0 },
+      dischargingTime: { enumerable: true, get: () => Infinity },
+      level: { enumerable: true, get: () => batteryLevel },
+      onchargingchange: { configurable: true, writable: true, value: null },
+      onlevelchange: { configurable: true, writable: true, value: null }
+    });
+    Object.defineProperty(navigator, "getBattery", {
+      configurable: true,
+      value() {
+        return request("battery").then(data => {
+          if (data && typeof data.level === "number") {
+            batteryLevel = Math.max(0, Math.min(1, data.level));
+          }
+          return batteryManager;
+        }).catch(() => batteryManager);
+      }
+    });
+    if (!("battery" in navigator)) {
+      Object.defineProperty(navigator, "battery", { configurable: true, get: () => batteryManager });
+    }
+    if (!("mozBattery" in navigator)) {
+      Object.defineProperty(navigator, "mozBattery", { configurable: true, get: () => batteryManager });
+    }
+  }
+
+  // navigator.mozVibrate is the legacy Firefox OS alias for navigator.vibrate.
+  if (typeof navigator.mozVibrate !== "function" && typeof navigator.vibrate === "function") {
+    Object.defineProperty(navigator, "mozVibrate", {
+      configurable: true,
+      value: (...args) => navigator.vibrate(...args)
+    });
+  }
+
   const storageDb = new Promise((resolve, reject) => {
     const open = indexedDB.open("kai-device-storage", 1);
     open.onupgradeneeded = () => open.result.createObjectStore("files", { keyPath: "name" });
@@ -634,4 +675,29 @@
     configurable: true,
     value: mozApps
   });
+
+  // KaiOS 3.x exposes web-platform APIs under navigator.b2g.*. Mirror the shims
+  // installed above so apps written for either generation locate their APIs.
+  if (!navigator.b2g) {
+    const b2g = {};
+    const mirror = (target, key, value) => {
+      if (value === undefined) return;
+      try {
+        Object.defineProperty(target, key, { configurable: true, enumerable: true, value });
+      } catch (_) {
+        // A read-only host property may already exist; leaving it untouched is safe.
+      }
+    };
+    mirror(b2g, "getDeviceStorage", navigator.getDeviceStorage && navigator.getDeviceStorage.bind(navigator));
+    mirror(b2g, "getDeviceStorages", navigator.getDeviceStorages && navigator.getDeviceStorages.bind(navigator));
+    mirror(b2g, "mozApps", navigator.mozApps);
+    mirror(b2g, "b2gApps", navigator.mozApps);
+    mirror(b2g, "mozMobileConnections", navigator.mozMobileConnections);
+    mirror(b2g, "connection", navigator.connection);
+    mirror(b2g, "getBattery", navigator.getBattery && navigator.getBattery.bind(navigator));
+    mirror(b2g, "vibrate", navigator.vibrate && navigator.vibrate.bind(navigator));
+    mirror(b2g, "setMessageHandler", navigator.mozSetMessageHandler && navigator.mozSetMessageHandler.bind(navigator));
+    mirror(b2g, "requestWakeLock", navigator.requestWakeLock && navigator.requestWakeLock.bind(navigator));
+    Object.defineProperty(navigator, "b2g", { configurable: true, value: b2g });
+  }
 })();

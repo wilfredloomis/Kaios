@@ -10,12 +10,15 @@ This is an application runtime, not a KaiOS firmware or hardware emulator.
 - Rejects traversal paths, oversized packages, excessive entries, and native binaries
 - Stores installed packages in private app storage and metadata in SQLite
 - Gives every app a stable localhost port so browser storage is isolated by origin
+- Serves assets with correct MIME types, HTTP byte-range (media seeking), directory `index.html` fallback, and `OPTIONS`
 - Runs content in GeckoView at a 240 x 320 screen profile
 - Sends D-pad, number, star, hash, softkey, Enter, and Backspace events
 - Repeats `keydown` for long virtual-key presses
 - Exposes battery, network, vibration, location, and notification bridge calls
 - Proxies cross-origin fetch/XHR for privileged apps that request `systemXHR`
 - Provides legacy `mozApps`, device storage, mobile connection, and audio-channel shims
+- Exposes the Promise-based Battery Status API (`navigator.getBattery`) backed by the real device
+- Mirrors the shims under a KaiOS 3.x `navigator.b2g` namespace
 - Supports process-local Firefox OS system-message registration and wake-lock mocks
 - Checks KaiOS manifest permissions before privileged native calls
 - Captures page console messages, errors, focused elements, key events, and API calls
