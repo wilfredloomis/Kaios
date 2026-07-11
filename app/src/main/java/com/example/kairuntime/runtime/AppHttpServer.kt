@@ -18,10 +18,12 @@ import java.util.concurrent.Executors
  * bridge script into HTML documents and serves a synthetic script at
  * [HttpAssets.RUNTIME_SCRIPT_PATH]. Correct MIME typing matters because GeckoView
  * enforces `X-Content-Type-Options: nosniff`: a script served as `text/plain` is
- * refused, which is the failure that broke real KaiOS apps (e.g. `common/js/cache.js`).
+ * refused, which is the failure that broke real KaiOS apps (e.g. `dist/main.js`,
+ * `common/js/cache.js`).
  *
  * Byte-range requests are supported so audio/video seeking works, and directory
- * requests fall back to `index.html`.
+ * requests fall back to `index.html`. CORS headers are advertised so same-origin
+ * workers and service-worker-like patterns inside packages keep working.
  */
 class AppHttpServer(private val root: File, port: Int, private val runtimeScript: ByteArray) : Closeable {
     private val server = ServerSocket(port, 32, InetAddress.getByName("127.0.0.1"))
@@ -56,18 +58,22 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
 
         // Read request headers (retaining Range) with a bound to avoid abuse.
         var rangeHeader: String? = null
+        var originHeader: String? = null
         var headerCount = 0
         while (true) {
             val line = reader.readLine()
             if (line.isNullOrEmpty()) break
             if (++headerCount > MAX_HEADERS) break
-            if (line.length >= 6 && line.regionMatches(0, "Range:", 0, 6, ignoreCase = true)) {
-                rangeHeader = line.substring(6).trim()
+            when {
+                line.regionMatches(0, "Range:", 0, 6, ignoreCase = true) ->
+                    rangeHeader = line.substring(6).trim()
+                line.regionMatches(0, "Origin:", 0, 7, ignoreCase = true) ->
+                    originHeader = line.substring(7).trim()
             }
         }
 
         if (method == "OPTIONS") {
-            respondOptions(client)
+            respondOptions(client, originHeader)
             return@use
         }
         if (method != "GET" && method != "HEAD") {
@@ -104,12 +110,19 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
             return@use
         }
 
-        serveFile(client, resolved, rangeHeader, headOnly)
+        serveFile(client, resolved, relative, rangeHeader, headOnly)
     }
 
-    private fun serveFile(client: Socket, file: File, rangeHeader: String?, headOnly: Boolean) {
+    private fun serveFile(
+        client: Socket,
+        file: File,
+        relativePath: String,
+        rangeHeader: String?,
+        headOnly: Boolean,
+    ) {
         val length = file.length()
-        val type = HttpAssets.mimeType(file)
+        // Prefer path-aware typing so /dist/main.js is never text/plain under nosniff.
+        val type = HttpAssets.mimeTypeForPath(relativePath, file)
         val range = rangeHeader?.let { HttpAssets.parseRange(it, length) }
         if (range != null) {
             val (start, end) = range
@@ -144,11 +157,15 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
         }
     }
 
-    private fun respondOptions(client: Socket) {
+    private fun respondOptions(client: Socket, origin: String?) {
         val output = client.getOutputStream()
+        val allowOrigin = if (origin != null && origin.startsWith("http://127.0.0.1")) origin else "*"
         output.write(
             ("HTTP/1.1 204 No Content\r\n" +
                 "Allow: GET, HEAD, OPTIONS\r\n" +
+                "Access-Control-Allow-Origin: $allowOrigin\r\n" +
+                "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" +
+                "Access-Control-Allow-Headers: *\r\n" +
                 "Accept-Ranges: bytes\r\n" +
                 "Content-Length: 0\r\n" +
                 "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII),
@@ -170,6 +187,11 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
             append("Content-Length: ").append(contentLength).append("\r\n")
             append("Cache-Control: no-cache\r\n")
             append("X-Content-Type-Options: nosniff\r\n")
+            append("Access-Control-Allow-Origin: *\r\n")
+            // Help service-worker / module scripts inside packages.
+            if (type.startsWith("text/javascript") || type.startsWith("application/javascript")) {
+                append("Cross-Origin-Resource-Policy: cross-origin\r\n")
+            }
             if (extraHeaders.isNotEmpty()) append(extraHeaders)
             append("Connection: close\r\n\r\n")
         }

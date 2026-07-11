@@ -18,6 +18,8 @@ class HttpAssetsTest {
         assertEquals("text/javascript; charset=utf-8", HttpAssets.mimeTypeForExtension("js"))
         assertEquals("text/javascript; charset=utf-8", HttpAssets.mimeTypeForExtension("mjs"))
         assertEquals("text/javascript; charset=utf-8", HttpAssets.mimeTypeForExtension("cjs"))
+        assertEquals("text/javascript; charset=utf-8", HttpAssets.mimeTypeForExtension("jsx"))
+        assertEquals("text/javascript; charset=utf-8", HttpAssets.mimeTypeForExtension("es6"))
     }
 
     @Test fun stylesheetsAndDataFormatsAreTypedCorrectly() {
@@ -37,6 +39,46 @@ class HttpAssetsTest {
     @Test fun unknownExtensionFallsBackToOctetStream() {
         assertEquals("application/octet-stream", HttpAssets.mimeTypeForExtension("xyz"))
         assertEquals("application/octet-stream", HttpAssets.mimeTypeForExtension(""))
+    }
+
+    @Test fun distMainJsIsTypedAsJavaScriptByPathHint() {
+        // Regression from crash log: dist/main.js was served as text/plain and blocked.
+        assertEquals(
+            "text/javascript; charset=utf-8",
+            HttpAssets.mimeTypeForPath("dist/main.js"),
+        )
+        assertEquals(
+            "text/javascript; charset=utf-8",
+            HttpAssets.mimeTypeForPath("assets/js/app.bundle"),
+        )
+        assertEquals(
+            "text/javascript; charset=utf-8",
+            HttpAssets.mimeTypeForPath("common/js/cache.js"),
+        )
+    }
+
+    @Test fun sniffsExtensionlessJavaScriptBundles() {
+        val root = temp.newFolder("app")
+        val bundle = File(root, "dist/chunk").apply {
+            parentFile!!.mkdirs()
+            writeText("(function(){\"use strict\";window.app=1;})();")
+        }
+        assertEquals(
+            "text/javascript; charset=utf-8",
+            HttpAssets.mimeTypeForPath("dist/chunk", bundle),
+        )
+    }
+
+    @Test fun sniffsHtmlAndCssWithoutExtension() {
+        val root = temp.newFolder("app")
+        val html = File(root, "page").apply {
+            writeText("<!DOCTYPE html><html><body>hi</body></html>")
+        }
+        assertEquals("text/html; charset=utf-8", HttpAssets.mimeTypeForPath("page", html))
+        val css = File(root, "theme").apply {
+            writeText("@charset \"utf-8\"; body { color: red; }")
+        }
+        assertEquals("text/css; charset=utf-8", HttpAssets.mimeTypeForPath("theme", css))
     }
 
     // --- Range parsing ---------------------------------------------------

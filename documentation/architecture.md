@@ -46,3 +46,23 @@ lives in `HttpAssets` so it can be unit-tested on the JVM without a live socket.
 3. Add Gecko permission delegates for standard web geolocation, media, and notifications.
 4. Add per-app data clearing, orientation switching, screenshots, offline simulation, and configurable API mocks.
 5. Add contacts, alarms, device storage, camera capture, sharing, and activity handlers.
+
+
+## Network and messaging compatibility
+
+Internet-facing KaiOS packages (Telegram ports, Facebook, chat clients) typically need three
+capabilities that stock GeckoView does not provide for loopback origins:
+
+1. **Correct MIME types under `nosniff`.** Bundlers often ship scripts as `dist/main.js` or
+   extension-less chunks. `HttpAssets.mimeTypeForPath` combines extension tables, path hints
+   (`/dist/`, `/js/`), and a light content sniffer so scripts are never served as `text/plain`.
+2. **Privileged cross-origin XHR (`systemXHR`).** The page-runtime `fetch`/`XMLHttpRequest`
+   shims try the native path first, then fall back to a WebExtension background proxy that
+   is allowed for packages declaring `systemXHR`, `tcp-socket`, or `type: privileged|certified`.
+   Private / loopback targets are rejected.
+3. **Raw TCP (`navigator.mozTCPSocket`).** `TcpSocketBridge` opens real Android TCP or TLS
+   sockets and streams data back through the native-messaging port. Private hosts are blocked
+   so a package cannot scan the LAN.
+
+The runtime also advertises a KaiOS 2.5 user-agent so CDN feature detection selects the
+feature-phone layout path.

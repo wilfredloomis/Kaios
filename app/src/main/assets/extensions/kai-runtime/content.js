@@ -26,10 +26,25 @@
   }
 
   port.onMessage.addListener(message => {
-    if (message.type === "key") {
-      dispatchToPage("kai-key", message);
-    } else if (message.type === "response") {
-      dispatchToPage("kai-api-response", message);
+    if (!message || typeof message !== "object") return;
+    switch (message.type) {
+      case "key":
+        dispatchToPage("kai-key", message);
+        break;
+      case "response":
+        dispatchToPage("kai-api-response", message);
+        break;
+      case "tcp":
+        dispatchToPage("kai-tcp-event", message);
+        break;
+      case "runtime-info":
+        dispatchToPage("kai-runtime-info", message);
+        break;
+      case "network-control":
+        dispatchToPage("kai-network-control", message);
+        break;
+      default:
+        break;
     }
   });
 
@@ -46,6 +61,13 @@
 
   document.addEventListener("kai-runtime-log", event => {
     if (event.detail) safePost(event.detail);
+  });
+
+  document.addEventListener("kai-tcp-request", event => {
+    if (location.hostname !== "127.0.0.1") return;
+    const detail = event.detail;
+    if (!detail || detail.type !== "tcp") return;
+    safePost(detail);
   });
 
   document.addEventListener("kai-network-request", async event => {
@@ -69,9 +91,15 @@
       requestAnimationFrame(injectRuntime);
       return;
     }
+    // Avoid double-injection if the HTML rewrite already loaded page-runtime.js.
+    if (document.documentElement.dataset.kaiRuntimeInjected === "1") return;
+    document.documentElement.dataset.kaiRuntimeInjected = "1";
     const script = document.createElement("script");
     script.src = browser.runtime.getURL("page-runtime.js");
     script.onload = () => script.remove();
+    script.onerror = () => {
+      // Fallback: the HTML-injected copy from AppHttpServer may still work.
+    };
     document.documentElement.appendChild(script);
   }
 
