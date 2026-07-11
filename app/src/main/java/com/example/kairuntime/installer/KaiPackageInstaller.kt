@@ -35,6 +35,10 @@ class KaiPackageInstaller(private val context: Context) {
                 File(staging, it).isFile
             }
             val permissions = manifest.optJSONObject("permissions") ?: JSONObject()
+            // Persist the KaiOS app type (web / privileged / certified) so the
+            // runtime can unlock systemXHR / TCP for privileged packages.
+            val manifestType = manifest.optString("type", "web").trim().ifBlank { "web" }.lowercase()
+            permissions.put("_appType", manifestType)
 
             val installation = File(appsRoot, id)
             check(staging.renameTo(installation)) { "Could not finalize installation" }
@@ -46,7 +50,7 @@ class KaiPackageInstaller(private val context: Context) {
                 manifestPath = File(installation, MANIFEST_NAME).absolutePath,
                 iconPath = iconPath?.let { File(installation, it).absolutePath },
                 installationPath = installation.absolutePath,
-                appType = "packaged",
+                appType = manifestType,
                 permissionsJson = permissions.toString(),
                 port = allocatePort(),
             )

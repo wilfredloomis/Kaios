@@ -1,6 +1,7 @@
 package com.example.kairuntime.runtime
 
 import java.io.File
+import java.io.RandomAccessFile
 
 /**
  * Pure, side-effect-free helpers behind [AppHttpServer]. Keeping MIME typing,
@@ -15,7 +16,7 @@ internal object HttpAssets {
      * Content-Type table covering the asset kinds KaiOS packages ship. Correct
      * types are required because GeckoView refuses mistyped scripts/styles under
      * `X-Content-Type-Options: nosniff`; a script mislabelled `text/plain` (the
-     * failure seen with `common/js/cache.js`) is silently blocked.
+     * failure seen with `common/js/cache.js` and `dist/main.js`) is silently blocked.
      */
     val MIME_TYPES: Map<String, String> = mapOf(
         // Documents
@@ -26,6 +27,11 @@ internal object HttpAssets {
         "js" to "text/javascript; charset=utf-8",
         "mjs" to "text/javascript; charset=utf-8",
         "cjs" to "text/javascript; charset=utf-8",
+        "jsx" to "text/javascript; charset=utf-8",
+        "ts" to "text/javascript; charset=utf-8",
+        "tsx" to "text/javascript; charset=utf-8",
+        "es" to "text/javascript; charset=utf-8",
+        "es6" to "text/javascript; charset=utf-8",
         "json" to "application/json; charset=utf-8",
         "map" to "application/json; charset=utf-8",
         "webapp" to "application/json; charset=utf-8",
@@ -70,15 +76,109 @@ internal object HttpAssets {
         // Misc
         "pdf" to "application/pdf",
         "zip" to "application/zip",
+        "gz" to "application/gzip",
+        "tgz" to "application/gzip",
+        "bin" to "application/octet-stream",
+        "dat" to "application/octet-stream",
     )
 
-    fun mimeType(file: File): String = mimeTypeForExtension(file.extension)
+    /** Path segments that almost always contain JavaScript in KaiOS packages. */
+    private val SCRIPT_PATH_HINTS = listOf(
+        "/js/", "/javascript/", "/scripts/", "/dist/", "/bundle/",
+        "/assets/js/", "/static/js/", "/vendor/", "/lib/", "/libs/",
+    )
+
+    fun mimeType(file: File): String = mimeTypeForPath(file.name)
+
+    /**
+     * Resolves a Content-Type from a path. When the extension is unknown, peeks at
+     * path hints (`/dist/`, `/js/`) and, if a [file] is provided, sniffs the first
+     * bytes for JavaScript/CSS/HTML so extension-less bundles still load under nosniff.
+     */
+    fun mimeTypeForPath(path: String, file: File? = null): String {
+        val name = path.substringAfterLast('/').substringAfterLast('\\')
+        val extension = name.substringAfterLast('.', missingDelimiterValue = "").lowercase()
+        MIME_TYPES[extension]?.let { return it }
+
+        val lowerPath = path.lowercase().replace('\\', '/')
+        if (SCRIPT_PATH_HINTS.any { lowerPath.contains(it) }) {
+            return "text/javascript; charset=utf-8"
+        }
+        // Extension-less names that are still scripts (e.g. "main", "app.bundle").
+        if (name.contains("bundle", ignoreCase = true) ||
+            name.contains("chunk", ignoreCase = true) ||
+            name.endsWith(".min", ignoreCase = true)
+        ) {
+            return "text/javascript; charset=utf-8"
+        }
+
+        if (file != null && file.isFile && file.length() > 0) {
+            sniffContent(file)?.let { return it }
+        }
+        return "application/octet-stream"
+    }
 
     fun mimeTypeForExtension(extension: String): String =
         MIME_TYPES[extension.lowercase()] ?: "application/octet-stream"
 
     fun isHtml(file: File): Boolean =
         file.extension.equals("html", true) || file.extension.equals("htm", true)
+
+    /**
+     * Lightweight content sniff for extension-less or mistyped assets. Only peeks
+     * the first 512 bytes; never reads the full file.
+     */
+    fun sniffContent(file: File): String? {
+        val sample = ByteArray(minOf(512L, file.length()).toInt())
+        if (sample.isEmpty()) return null
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                raf.readFully(sample)
+            }
+            val text = String(sample, Charsets.UTF_8).trimStart('\uFEFF', ' ', '\t', '\r', '\n')
+            when {
+                text.startsWith("<!DOCTYPE", ignoreCase = true) ||
+                    text.startsWith("<html", ignoreCase = true) ||
+                    text.startsWith("<!--") && text.contains("<html", ignoreCase = true) ->
+                    "text/html; charset=utf-8"
+                text.startsWith("@charset") || text.startsWith("@import") ||
+                    text.startsWith("@media") || text.startsWith("@font-face") ||
+                    Regex("""^[.#@\w*\[:].*\{""", RegexOption.DOT_MATCHES_ALL).containsMatchIn(text.take(80)) &&
+                    text.contains('{') && text.contains('}') && !text.contains("function") ->
+                    "text/css; charset=utf-8"
+                looksLikeJavaScript(text) -> "text/javascript; charset=utf-8"
+                text.startsWith("{") || text.startsWith("[") -> "application/json; charset=utf-8"
+                text.startsWith("<?xml") -> "application/xml; charset=utf-8"
+                else -> null
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private fun looksLikeJavaScript(text: String): Boolean {
+        val head = text.take(200)
+        return head.startsWith("#!") ||
+            head.startsWith("(function") ||
+            head.startsWith("!function") ||
+            head.startsWith("\"use strict\"") ||
+            head.startsWith("'use strict'") ||
+            head.startsWith("import ") ||
+            head.startsWith("export ") ||
+            head.startsWith("const ") ||
+            head.startsWith("let ") ||
+            head.startsWith("var ") ||
+            head.startsWith("function ") ||
+            head.startsWith("class ") ||
+            head.startsWith("/*") ||
+            head.startsWith("//") ||
+            head.startsWith("System.register") ||
+            head.startsWith("define(") ||
+            head.startsWith("require(") ||
+            head.startsWith("webpack") ||
+            head.contains("typeof exports") ||
+            head.contains("module.exports")
+    }
 
     /**
      * Maps a request path to a real file below [root], applying directory index

@@ -5,12 +5,32 @@
   let sequence = 0;
   const pending = new Map();
   const networkPending = new Map();
+  const tcpSockets = new Map();
   const nativeFetch = window.fetch.bind(window);
+  let networkEnabled = true;
+  let privilegedHint = false;
 
-  const systemXhrAllowed = nativeFetch("/manifest.webapp", { cache: "no-store" })
-    .then(response => response.ok ? response.json() : {})
-    .then(manifest => Object.keys(manifest.permissions || {}).some(name => name.toLowerCase() === "systemxhr"))
-    .catch(() => false);
+  // ---------------------------------------------------------------------------
+  // Manifest inspection – systemXHR / privileged / tcp-socket unlock network
+  // ---------------------------------------------------------------------------
+  const manifestPromise = nativeFetch("/manifest.webapp", { cache: "no-store" })
+    .then(response => (response.ok ? response.json() : {}))
+    .catch(() => ({}));
+
+  const systemXhrAllowed = manifestPromise.then(manifest => {
+    const permissions = manifest.permissions || {};
+    const keys = Object.keys(permissions).map(k => k.toLowerCase());
+    const type = String(manifest.type || "").toLowerCase();
+    privilegedHint = type === "privileged" || type === "certified";
+    return (
+      privilegedHint ||
+      keys.includes("systemxhr") ||
+      keys.includes("tcp-socket") ||
+      keys.includes("network-tcp") ||
+      keys.includes("mobileconnection") ||
+      keys.includes("wifi-manage")
+    );
+  }).catch(() => false);
 
   function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
@@ -27,6 +47,9 @@
     return Uint8Array.from(binary, character => character.charCodeAt(0));
   }
 
+  // ---------------------------------------------------------------------------
+  // Cross-origin network proxy (systemXHR)
+  // ---------------------------------------------------------------------------
   document.addEventListener("kai-network-response", event => {
     const detail = event.detail || {};
     const callback = networkPending.get(detail.id);
@@ -38,6 +61,10 @@
 
   function proxyNetworkRequest(detail) {
     return new Promise((resolve, reject) => {
+      if (!networkEnabled) {
+        reject(new TypeError("Network is disabled (offline simulation)"));
+        return;
+      }
       networkPending.set(detail.id, { resolve, reject });
       document.dispatchEvent(new CustomEvent("kai-network-request", { detail }));
       setTimeout(() => {
@@ -45,25 +72,48 @@
         if (!callback) return;
         networkPending.delete(detail.id);
         callback.reject(new TypeError("Proxied network request timed out"));
-      }, 30000);
+      }, 45000);
     });
   }
 
   async function compatibleFetch(input, init) {
     const request = new Request(input, init);
     const target = new URL(request.url, location.href);
-    if (target.origin === location.origin || !/^https?:$/.test(target.protocol) || !(await systemXhrAllowed)) {
+
+    // Same-origin, non-http(s), or offline simulation → native path.
+    if (target.origin === location.origin || !/^https?:$/.test(target.protocol)) {
+      return nativeFetch(input, init);
+    }
+    if (!networkEnabled) throw new TypeError("Failed to fetch (network disabled)");
+
+    // Always try native first – Gecko may allow CORS if the remote sends headers.
+    // Fall back to the privileged proxy for apps that declared systemXHR / privileged.
+    try {
+      const nativeResponse = await nativeFetch(input, init);
+      // Opaque / opaque-redirect responses from no-cors mode are useless for XHR;
+      // if the caller used cors mode and we got a real response, return it.
+      if (nativeResponse.type !== "opaque" && nativeResponse.type !== "opaqueredirect") {
+        return nativeResponse;
+      }
+    } catch (_) {
+      // CORS or network failure – try proxy if allowed.
+    }
+
+    if (!(await systemXhrAllowed)) {
       return nativeFetch(input, init);
     }
 
     let bodyBase64 = null;
     if (request.method !== "GET" && request.method !== "HEAD") {
       const body = await request.clone().arrayBuffer();
-      if (body.byteLength > 5 * 1024 * 1024) throw new TypeError("Network request exceeds 5 MB");
+      if (body.byteLength > 8 * 1024 * 1024) throw new TypeError("Network request exceeds 8 MB");
       bodyBase64 = arrayBufferToBase64(body);
     }
     const headers = {};
     request.headers.forEach((value, name) => { headers[name] = value; });
+    // Ensure a KaiOS-like Accept default so CDNs don't 406.
+    if (!headers.accept && !headers.Accept) headers["Accept"] = "*/*";
+
     const result = await proxyNetworkRequest({
       id: `network-${Date.now()}-${++sequence}`,
       url: target.href,
@@ -84,6 +134,9 @@
 
   Object.defineProperty(window, "fetch", { configurable: true, writable: true, value: compatibleFetch });
 
+  // ---------------------------------------------------------------------------
+  // XMLHttpRequest shim (routes through compatibleFetch)
+  // ---------------------------------------------------------------------------
   class CompatibleXMLHttpRequest extends EventTarget {
     constructor() {
       super();
@@ -140,6 +193,7 @@
         const buffer = await response.arrayBuffer();
         this.readyState = 3;
         this._emit("readystatechange");
+        this._emit("progress");
         const contentType = response.headers.get("content-type") || "";
         const text = new TextDecoder().decode(buffer);
         if (this.responseType === "arraybuffer") this.response = buffer;
@@ -200,6 +254,177 @@
     value: CompatibleXMLHttpRequest
   });
 
+  // ---------------------------------------------------------------------------
+  // mozTCPSocket – Firefox OS / KaiOS raw TCP (used by Telegram ports)
+  // ---------------------------------------------------------------------------
+  document.addEventListener("kai-tcp-event", event => {
+    const detail = event.detail || {};
+    const socket = tcpSockets.get(detail.socketId);
+    if (!socket) return;
+    const data = detail.data || {};
+    switch (detail.event) {
+      case "open":
+      case "opened":
+        socket.readyState = "open";
+        socket._emit("open");
+        break;
+      case "data": {
+        let payload;
+        if (data.dataBase64) {
+          const bytes = base64ToBytes(data.dataBase64);
+          payload = socket.binaryType === "arraybuffer" ? bytes.buffer : new TextDecoder().decode(bytes);
+        } else {
+          payload = data.text || "";
+        }
+        socket._emit("data", { data: payload });
+        break;
+      }
+      case "error":
+        socket._emit("error", { data: new Error(data.message || "TCP error"), message: data.message });
+        break;
+      case "close":
+        socket.readyState = "closed";
+        socket._emit("close");
+        tcpSockets.delete(detail.socketId);
+        break;
+      default:
+        break;
+    }
+  });
+
+  function createTCPSocket(host, port, options) {
+    options = options || {};
+    const binaryType = options.binaryType === "arraybuffer" ? "arraybuffer" : "string";
+    const useSecureTransport = Boolean(options.useSecureTransport);
+    const requestId = `tcp-${Date.now()}-${++sequence}`;
+    const socket = {
+      host: String(host),
+      port: Number(port),
+      ssl: useSecureTransport,
+      binaryType,
+      bufferedAmount: 0,
+      readyState: "connecting",
+      onopen: null,
+      ondata: null,
+      onerror: null,
+      onclose: null,
+      _listeners: { open: [], data: [], error: [], close: [] },
+      _socketId: null,
+      addEventListener(type, listener) {
+        if (this._listeners[type]) this._listeners[type].push(listener);
+      },
+      removeEventListener(type, listener) {
+        if (!this._listeners[type]) return;
+        this._listeners[type] = this._listeners[type].filter(l => l !== listener);
+      },
+      _emit(type, extra) {
+        const event = Object.assign({ type, target: this }, extra || {});
+        const handler = this[`on${type}`];
+        if (typeof handler === "function") {
+          try { handler.call(this, event); } catch (e) { console.error(e); }
+        }
+        (this._listeners[type] || []).forEach(listener => {
+          try { listener.call(this, event); } catch (e) { console.error(e); }
+        });
+      },
+      send(data) {
+        if (this.readyState !== "open" || this._socketId == null) {
+          throw new DOMException("TCPSocket is not open", "InvalidStateError");
+        }
+        const message = {
+          type: "tcp",
+          action: "send",
+          socketId: this._socketId
+        };
+        if (typeof data === "string") {
+          message.text = data;
+        } else if (data instanceof ArrayBuffer) {
+          message.dataBase64 = arrayBufferToBase64(data);
+        } else if (ArrayBuffer.isView(data)) {
+          message.dataBase64 = arrayBufferToBase64(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
+        } else {
+          message.text = String(data);
+        }
+        document.dispatchEvent(new CustomEvent("kai-tcp-request", { detail: message }));
+        return true;
+      },
+      suspend() {},
+      resume() {},
+      close() {
+        if (this._socketId != null) {
+          document.dispatchEvent(new CustomEvent("kai-tcp-request", {
+            detail: { type: "tcp", action: "close", socketId: this._socketId }
+          }));
+        }
+        this.readyState = "closing";
+      }
+    };
+
+    // Temporary id until Android assigns a real one via "opened" event.
+    // We track by requestId first, then re-key on socketId.
+    const pendingKey = requestId;
+    tcpSockets.set(pendingKey, socket);
+
+    document.addEventListener("kai-tcp-event", function onOpened(event) {
+      const detail = event.detail || {};
+      if (detail.requestId !== requestId && detail.event !== "opened" && detail.event !== "open") return;
+      if (detail.requestId && detail.requestId !== requestId) return;
+      if (detail.event === "opened" || detail.event === "open") {
+        if (detail.requestId && detail.requestId !== requestId) return;
+        // Accept first opened after our request if requestId matches, or if we
+        // haven't been assigned yet and this is the only connecting socket.
+        if (socket._socketId != null) return;
+        if (detail.requestId === requestId || (!detail.requestId && socket.readyState === "connecting")) {
+          socket._socketId = detail.socketId;
+          tcpSockets.delete(pendingKey);
+          tcpSockets.set(detail.socketId, socket);
+          document.removeEventListener("kai-tcp-event", onOpened);
+        }
+      }
+      if (detail.event === "error" && detail.requestId === requestId) {
+        socket.readyState = "closed";
+        socket._emit("error", { data: new Error((detail.data && detail.data.message) || "TCP open failed") });
+        socket._emit("close");
+        tcpSockets.delete(pendingKey);
+        document.removeEventListener("kai-tcp-event", onOpened);
+      }
+    });
+
+    document.dispatchEvent(new CustomEvent("kai-tcp-request", {
+      detail: {
+        type: "tcp",
+        action: "open",
+        requestId,
+        host: String(host),
+        port: Number(port),
+        useSecureTransport,
+        binaryType
+      }
+    }));
+
+    return socket;
+  }
+
+  // navigator.mozTCPSocket.open(host, port, options)
+  const mozTCPSocket = {
+    open: createTCPSocket,
+    listen() {
+      throw new DOMException("TCPSocket.listen is not supported in Kai Runtime", "NotSupportedError");
+    }
+  };
+  Object.defineProperty(navigator, "mozTCPSocket", {
+    configurable: true,
+    enumerable: true,
+    value: mozTCPSocket
+  });
+  // Some ports check window.TCPSocket or navigator.TCPSocket.
+  if (!window.TCPSocket) {
+    Object.defineProperty(window, "TCPSocket", { configurable: true, value: mozTCPSocket });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Audio / media compatibility
+  // ---------------------------------------------------------------------------
   const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
   if (NativeAudioContext) {
     function CompatibleAudioContext(options) {
@@ -244,6 +469,9 @@
     value: audioChannelManager
   });
 
+  // ---------------------------------------------------------------------------
+  // System messages + wake locks
+  // ---------------------------------------------------------------------------
   const systemMessageHandlers = new Map();
   Object.defineProperty(navigator, "mozSetMessageHandler", {
     configurable: true,
@@ -279,6 +507,9 @@
     Object.defineProperty(navigator, "mozRequestWakeLock", { configurable: true, value: requestWakeLock });
   }
 
+  // ---------------------------------------------------------------------------
+  // Native bridge (API calls)
+  // ---------------------------------------------------------------------------
   function request(api, args) {
     const callbackId = `kai-${Date.now()}-${++sequence}`;
     return new Promise((resolve, reject) => {
@@ -310,17 +541,79 @@
     else callback.reject(new Error(response.error || "Kai Runtime API request failed"));
   });
 
-  document.addEventListener("kai-key", event => {
+  // Runtime info / network control from Android
+  document.addEventListener("kai-runtime-info", event => {
     const detail = event.detail || {};
-    const target = document.activeElement || document.body || document.documentElement;
-    target.dispatchEvent(new KeyboardEvent(detail.phase === "up" ? "keyup" : "keydown", {
-      key: detail.key,
-      bubbles: true,
-      cancelable: true,
-      repeat: Boolean(detail.repeat)
-    }));
+    if (typeof detail.networkEnabled === "boolean") networkEnabled = detail.networkEnabled;
+    if (detail.privileged) privilegedHint = true;
+  });
+  document.addEventListener("kai-network-control", event => {
+    const detail = event.detail || {};
+    if (typeof detail.enabled === "boolean") {
+      networkEnabled = detail.enabled;
+      window.dispatchEvent(new Event(networkEnabled ? "online" : "offline"));
+    }
   });
 
+  // ---------------------------------------------------------------------------
+  // Key events with KaiOS keyCode values (softkeys, call, etc.)
+  // ---------------------------------------------------------------------------
+  // KaiOS softkey codes: primary SoftLeft/SoftRight are 37/39 (same as arrows);
+  // apps distinguish via event.key. Some devices also emit 403/404.
+  const KEY_CODES = {
+    SoftLeft: 37,
+    SoftRight: 39,
+    Enter: 13,
+    ArrowUp: 38,
+    ArrowDown: 40,
+    ArrowLeft: 37,
+    ArrowRight: 39,
+    Backspace: 8,
+    Call: 419,
+    EndCall: 420,
+    "*": 170,
+    "#": 163
+  };
+
+  document.addEventListener("kai-key", event => {
+    const detail = event.detail || {};
+    const key = detail.key || "";
+    const keyCode = typeof detail.keyCode === "number" ? detail.keyCode : (KEY_CODES[key] || (key.length === 1 ? key.charCodeAt(0) : 0));
+    const target = document.activeElement || document.body || document.documentElement;
+    const type = detail.phase === "up" ? "keyup" : "keydown";
+    const init = {
+      key,
+      code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
+      keyCode,
+      which: keyCode,
+      bubbles: true,
+      cancelable: true,
+      repeat: Boolean(detail.repeat),
+      composed: true
+    };
+    // KeyboardEvent constructor ignores keyCode in modern Gecko; define after.
+    const keyboardEvent = new KeyboardEvent(type, init);
+    try {
+      Object.defineProperty(keyboardEvent, "keyCode", { get: () => keyCode });
+      Object.defineProperty(keyboardEvent, "which", { get: () => keyCode });
+      Object.defineProperty(keyboardEvent, "charCode", { get: () => 0 });
+    } catch (_) { /* read-only on some builds */ }
+
+    const cancelled = !target.dispatchEvent(keyboardEvent);
+    // Also fire on window/document for apps that listen there.
+    if (!cancelled) {
+      window.dispatchEvent(keyboardEvent);
+    }
+
+    // SoftLeft / SoftRight often double as lsk/rsk custom events in KaiUI apps.
+    if (type === "keydown" && (key === "SoftLeft" || key === "SoftRight")) {
+      window.dispatchEvent(new CustomEvent(key === "SoftLeft" ? "lsk" : "rsk", { bubbles: true }));
+    }
+  });
+
+  // ---------------------------------------------------------------------------
+  // Console / error forwarding
+  // ---------------------------------------------------------------------------
   function logToAndroid(payload) {
     document.dispatchEvent(new CustomEvent("kai-runtime-log", { detail: payload }));
   }
@@ -384,8 +677,11 @@
     logToAndroid({ type: "focus", element });
   });
 
+  // ---------------------------------------------------------------------------
+  // KaiRuntime surface
+  // ---------------------------------------------------------------------------
   const runtime = {
-    version: "0.2.1",
+    version: "0.3.0",
     profile: "kaios-2.5",
     platform: "android",
     capabilities: Object.freeze({
@@ -396,6 +692,7 @@
       notifications: true,
       deviceStorage: true,
       systemXHR: true,
+      tcpSocket: true,
       audioChannel: true,
       systemMessages: true,
       contacts: false,
@@ -406,23 +703,25 @@
     getNetwork: () => request("network"),
     vibrate: duration => request("vibrate", { duration }),
     getLocation: () => request("location"),
-    showNotification: (title, body) => request("notification", { title, body })
+    showNotification: (title, body) => request("notification", { title, body }),
+    getCapabilities: () => request("capabilities")
   };
 
   Object.freeze(runtime);
   Object.defineProperty(window, "KaiRuntime", { value: runtime, enumerable: true });
   Object.defineProperty(navigator, "kaiRuntime", { value: runtime, enumerable: true });
 
-  // Promise-based Battery Status API. Some KaiOS apps call navigator.getBattery()
-  // and expect a BatteryManager-like object; back it with the native bridge so the
-  // reported level reflects the real device instead of a static value.
+  // ---------------------------------------------------------------------------
+  // Battery Status API
+  // ---------------------------------------------------------------------------
   if (typeof navigator.getBattery !== "function") {
     const batteryManager = new EventTarget();
     let batteryLevel = 1;
+    let batteryCharging = true;
     Object.defineProperties(batteryManager, {
-      charging: { enumerable: true, get: () => true },
-      chargingTime: { enumerable: true, get: () => 0 },
-      dischargingTime: { enumerable: true, get: () => Infinity },
+      charging: { enumerable: true, get: () => batteryCharging },
+      chargingTime: { enumerable: true, get: () => (batteryCharging ? 0 : Infinity) },
+      dischargingTime: { enumerable: true, get: () => (batteryCharging ? Infinity : 7200) },
       level: { enumerable: true, get: () => batteryLevel },
       onchargingchange: { configurable: true, writable: true, value: null },
       onlevelchange: { configurable: true, writable: true, value: null }
@@ -434,6 +733,7 @@
           if (data && typeof data.level === "number") {
             batteryLevel = Math.max(0, Math.min(1, data.level));
           }
+          if (data && typeof data.charging === "boolean") batteryCharging = data.charging;
           return batteryManager;
         }).catch(() => batteryManager);
       }
@@ -446,7 +746,6 @@
     }
   }
 
-  // navigator.mozVibrate is the legacy Firefox OS alias for navigator.vibrate.
   if (typeof navigator.mozVibrate !== "function" && typeof navigator.vibrate === "function") {
     Object.defineProperty(navigator, "mozVibrate", {
       configurable: true,
@@ -454,6 +753,9 @@
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Device Storage (IndexedDB-backed)
+  // ---------------------------------------------------------------------------
   const storageDb = new Promise((resolve, reject) => {
     const open = indexedDB.open("kai-device-storage", 1);
     open.onupgradeneeded = () => open.result.createObjectStore("files", { keyPath: "name" });
@@ -605,15 +907,18 @@
     value(type) { return [navigator.getDeviceStorage(type)]; }
   });
 
+  // ---------------------------------------------------------------------------
+  // Connection / mobile connection
+  // ---------------------------------------------------------------------------
   const connectionInfo = new EventTarget();
   Object.defineProperties(connectionInfo, {
-    type: { enumerable: true, get: () => navigator.onLine ? "wifi" : "none" },
-    effectiveType: { enumerable: true, get: () => navigator.onLine ? "4g" : "slow-2g" },
-    downlink: { enumerable: true, get: () => navigator.onLine ? 10 : 0 },
-    rtt: { enumerable: true, get: () => navigator.onLine ? 50 : 0 },
+    type: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? "wifi" : "none") },
+    effectiveType: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? "4g" : "slow-2g") },
+    downlink: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? 10 : 0) },
+    rtt: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? 50 : 0) },
     saveData: { enumerable: true, value: false },
     metered: { enumerable: true, value: false },
-    bandwidth: { enumerable: true, get: () => navigator.onLine ? 10 : 0 }
+    bandwidth: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? 10 : 0) }
   });
   if (!navigator.connection) {
     Object.defineProperty(navigator, "connection", { configurable: true, value: connectionInfo });
@@ -633,10 +938,10 @@
     data: {
       enumerable: true,
       get: () => ({
-        connected: navigator.onLine,
+        connected: networkEnabled && navigator.onLine,
         roaming: false,
         network: null,
-        type: navigator.onLine ? "wifi" : null
+        type: networkEnabled && navigator.onLine ? "wifi" : null
       })
     }
   });
@@ -645,11 +950,17 @@
   if (!navigator.mozMobileConnections) {
     Object.defineProperty(navigator, "mozMobileConnections", { configurable: true, value: [mobileConnection] });
   }
+  if (!navigator.mozMobileConnection) {
+    Object.defineProperty(navigator, "mozMobileConnection", { configurable: true, value: mobileConnection });
+  }
 
+  // ---------------------------------------------------------------------------
+  // mozApps
+  // ---------------------------------------------------------------------------
   async function currentApplication() {
     let manifest = { name: document.title || "KaiOS App", type: "web", permissions: {} };
     try {
-      const response = await fetch("/manifest.webapp");
+      const response = await nativeFetch("/manifest.webapp", { cache: "no-store" });
       if (response.ok) manifest = await response.json();
     } catch (_) {
       // The generic manifest keeps legacy app-detection code operational.
@@ -676,17 +987,16 @@
     value: mozApps
   });
 
-  // KaiOS 3.x exposes web-platform APIs under navigator.b2g.*. Mirror the shims
-  // installed above so apps written for either generation locate their APIs.
+  // ---------------------------------------------------------------------------
+  // navigator.b2g (KaiOS 3.x)
+  // ---------------------------------------------------------------------------
   if (!navigator.b2g) {
     const b2g = {};
     const mirror = (target, key, value) => {
       if (value === undefined) return;
       try {
         Object.defineProperty(target, key, { configurable: true, enumerable: true, value });
-      } catch (_) {
-        // A read-only host property may already exist; leaving it untouched is safe.
-      }
+      } catch (_) { /* read-only host property */ }
     };
     mirror(b2g, "getDeviceStorage", navigator.getDeviceStorage && navigator.getDeviceStorage.bind(navigator));
     mirror(b2g, "getDeviceStorages", navigator.getDeviceStorages && navigator.getDeviceStorages.bind(navigator));
@@ -698,6 +1008,15 @@
     mirror(b2g, "vibrate", navigator.vibrate && navigator.vibrate.bind(navigator));
     mirror(b2g, "setMessageHandler", navigator.mozSetMessageHandler && navigator.mozSetMessageHandler.bind(navigator));
     mirror(b2g, "requestWakeLock", navigator.requestWakeLock && navigator.requestWakeLock.bind(navigator));
+    mirror(b2g, "TCPSocket", mozTCPSocket);
     Object.defineProperty(navigator, "b2g", { configurable: true, value: b2g });
   }
+
+  // Advertise online status for apps that check navigator.onLine at boot.
+  try {
+    Object.defineProperty(navigator, "onLine", {
+      configurable: true,
+      get: () => networkEnabled && true
+    });
+  } catch (_) { /* some engines lock onLine */ }
 })();
