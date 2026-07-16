@@ -9,10 +9,10 @@ android {
 
     defaultConfig {
         applicationId = "com.example.kairuntime"
-        minSdk = 23
+        minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.0"
+        versionCode = 11
+        versionName = "0.3.5"
 
         ndk {
             abiFilters += setOf("armeabi-v7a", "arm64-v8a")
@@ -33,12 +33,20 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+}
+
+kotlin {
+    compilerOptions {
+        jvmTarget = org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
     }
 }
 
 dependencies {
-    implementation("org.mozilla.geckoview:geckoview:128.0.20240725162350")
+    implementation("androidx.core:core:1.15.0") {
+        version {
+            strictly("1.15.0")
+        }
+    }
+    implementation("org.mozilla.geckoview:geckoview:150.0.20260511200624")
     testImplementation("junit:junit:4.13.2")
 }

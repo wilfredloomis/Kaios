@@ -3,31 +3,20 @@ package com.example.kairuntime.runtime
 import java.io.BufferedReader
 import java.io.Closeable
 import java.io.File
+import java.io.FileInputStream
 import java.io.InputStreamReader
-import java.io.RandomAccessFile
+import java.io.OutputStream
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URLDecoder
+import java.util.Locale
 import java.util.concurrent.Executors
 
-/**
- * Loopback-only static file server for a single installed KaiOS package.
- *
- * The server intentionally exposes only files below [root]. It injects the runtime
- * bridge script into HTML documents and serves a synthetic script at
- * [HttpAssets.RUNTIME_SCRIPT_PATH]. Correct MIME typing matters because GeckoView
- * enforces `X-Content-Type-Options: nosniff`: a script served as `text/plain` is
- * refused, which is the failure that broke real KaiOS apps (e.g. `dist/main.js`,
- * `common/js/cache.js`).
- *
- * Byte-range requests are supported so audio/video seeking works, and directory
- * requests fall back to `index.html`. CORS headers are advertised so same-origin
- * workers and service-worker-like patterns inside packages keep working.
- */
 class AppHttpServer(private val root: File, port: Int, private val runtimeScript: ByteArray) : Closeable {
     private val server = ServerSocket(port, 32, InetAddress.getByName("127.0.0.1"))
     private val workers = Executors.newCachedThreadPool()
+    private val safeRoot = root.canonicalFile
     @Volatile private var running = true
 
     init {
@@ -44,178 +33,191 @@ class AppHttpServer(private val root: File, port: Int, private val runtimeScript
     }
 
     private fun handle(socket: Socket) = socket.use { client ->
-        client.soTimeout = 15_000
-        client.tcpNoDelay = true
-        val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.US_ASCII))
-        val requestLine = reader.readLine() ?: return@use
-        if (requestLine.length > MAX_REQUEST_LINE) {
-            respond(client, 414, "text/plain; charset=utf-8", "URI too long".toByteArray(), false)
+        client.soTimeout = 10_000
+        val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.ISO_8859_1))
+        val requestLine = reader.readLine()?.split(' ') ?: return@use
+        val method = requestLine.firstOrNull().orEmpty()
+        if (requestLine.size < 2 || method !in ALLOWED_METHODS) {
+            respondBytes(client, 405, "text/plain; charset=utf-8", "Method not allowed".toByteArray(), method == "HEAD")
             return@use
         }
-        val request = requestLine.split(' ')
-        val method = request.firstOrNull()?.uppercase().orEmpty()
-        val headOnly = method == "HEAD"
-
-        // Read request headers (retaining Range) with a bound to avoid abuse.
-        var rangeHeader: String? = null
-        var originHeader: String? = null
-        var headerCount = 0
+        val headers = linkedMapOf<String, String>()
         while (true) {
-            val line = reader.readLine()
-            if (line.isNullOrEmpty()) break
-            if (++headerCount > MAX_HEADERS) break
-            when {
-                line.regionMatches(0, "Range:", 0, 6, ignoreCase = true) ->
-                    rangeHeader = line.substring(6).trim()
-                line.regionMatches(0, "Origin:", 0, 7, ignoreCase = true) ->
-                    originHeader = line.substring(7).trim()
-            }
+            val line = reader.readLine() ?: break
+            if (line.isEmpty()) break
+            val separator = line.indexOf(':')
+            if (separator > 0) headers[line.substring(0, separator).trim().lowercase(Locale.ROOT)] = line.substring(separator + 1).trim()
         }
 
-        if (method == "OPTIONS") {
-            respondOptions(client, originHeader)
-            return@use
-        }
-        if (method != "GET" && method != "HEAD") {
-            respond(client, 405, "text/plain; charset=utf-8", "Method not allowed".toByteArray(), false)
-            return@use
-        }
-        if (request.size < 2) {
-            respond(client, 400, "text/plain; charset=utf-8", "Bad request".toByteArray(), headOnly)
-            return@use
-        }
-
-        val rawPath = request[1].substringBefore('?').substringBefore('#')
-        val decoded = runCatching { URLDecoder.decode(rawPath, "UTF-8") }.getOrElse {
-            respond(client, 400, "text/plain; charset=utf-8", "Bad request".toByteArray(), headOnly)
+        val rawPath = requestLine[1].substringBefore('?').substringBefore('#')
+        val decoded = runCatching {
+            // URLDecoder treats '+' as a form-space, which is incorrect for URL paths.
+            URLDecoder.decode(rawPath.replace("+", "%2B"), "UTF-8")
+        }.getOrElse {
+            respondBytes(client, 400, "text/plain; charset=utf-8", "Bad request".toByteArray(), method == "HEAD")
             return@use
         }
         val relative = decoded.removePrefix("/").ifBlank { "index.html" }
-        if (relative == HttpAssets.RUNTIME_SCRIPT_PATH) {
-            respond(client, 200, "text/javascript; charset=utf-8", runtimeScript, headOnly)
+        if (relative == RUNTIME_SCRIPT_PATH) {
+            respondBytes(client, 200, "text/javascript; charset=utf-8", runtimeScript, method == "HEAD")
             return@use
         }
 
-        val resolved = HttpAssets.resolveFile(root, relative)
-        if (resolved == null) {
-            respond(client, 404, "text/plain; charset=utf-8", "Not found".toByteArray(), headOnly)
+        val file = File(safeRoot, relative).canonicalFile
+        if (!file.path.startsWith(safeRoot.path + File.separator) || !file.isFile) {
+            respondBytes(client, 404, "text/plain; charset=utf-8", "Not found".toByteArray(), method == "HEAD")
             return@use
         }
 
-        // HTML documents are rewritten to inject the runtime bridge; they never
-        // participate in range requests because their length changes on the fly.
-        if (HttpAssets.isHtml(resolved)) {
-            val body = HttpAssets.injectRuntime(resolved.readText(Charsets.UTF_8)).toByteArray(Charsets.UTF_8)
-            respond(client, 200, HttpAssets.mimeType(resolved), body, headOnly)
+        if (isHtml(file)) {
+            val body = injectRuntime(file.readText(Charsets.UTF_8)).toByteArray(Charsets.UTF_8)
+            respondBytes(client, 200, mimeType(file), body, method == "HEAD")
             return@use
         }
 
-        serveFile(client, resolved, relative, rangeHeader, headOnly)
+        respondFile(client, file, headers["range"], method == "HEAD")
     }
 
-    private fun serveFile(
-        client: Socket,
-        file: File,
-        relativePath: String,
-        rangeHeader: String?,
-        headOnly: Boolean,
-    ) {
+    private fun respondFile(socket: Socket, file: File, rangeHeader: String?, headOnly: Boolean) {
         val length = file.length()
-        // Prefer path-aware typing so /dist/main.js is never text/plain under nosniff.
-        val type = HttpAssets.mimeTypeForPath(relativePath, file)
-        val range = rangeHeader?.let { HttpAssets.parseRange(it, length) }
-        if (range != null) {
-            val (start, end) = range
-            val count = end - start + 1
-            val extraHeaders = "Content-Range: bytes $start-$end/$length\r\nAccept-Ranges: bytes\r\n"
-            writeHeaders(client, 206, type, count, extraHeaders)
-            if (!headOnly) {
-                RandomAccessFile(file, "r").use { raf ->
-                    raf.seek(start)
-                    streamBytes(client, raf, count)
+        val range = parseRange(rangeHeader, length)
+        if (rangeHeader != null && range == null) {
+            val output = socket.getOutputStream()
+            writeHeaders(output, 416, mimeType(file), 0, mapOf("Content-Range" to "bytes */$length"))
+            output.flush()
+            return
+        }
+
+        val start = range?.first ?: 0L
+        val end = range?.last ?: (length - 1L).coerceAtLeast(-1L)
+        val bodyLength = if (length == 0L) 0L else end - start + 1L
+        val extra = linkedMapOf("Accept-Ranges" to "bytes")
+        if (range != null) extra["Content-Range"] = "bytes $start-$end/$length"
+        val output = socket.getOutputStream()
+        writeHeaders(output, if (range == null) 200 else 206, mimeType(file), bodyLength, extra)
+        if (!headOnly && bodyLength > 0L) {
+            FileInputStream(file).use { input ->
+                var skipped = 0L
+                while (skipped < start) {
+                    val count = input.skip(start - skipped)
+                    if (count <= 0L) break
+                    skipped += count
+                }
+                val buffer = ByteArray(64 * 1024)
+                var remaining = bodyLength
+                while (remaining > 0L) {
+                    val count = input.read(buffer, 0, minOf(buffer.size.toLong(), remaining).toInt())
+                    if (count < 0) break
+                    output.write(buffer, 0, count)
+                    remaining -= count
                 }
             }
-        } else {
-            writeHeaders(client, 200, type, length, "Accept-Ranges: bytes\r\n")
-            if (!headOnly) {
-                RandomAccessFile(file, "r").use { raf -> streamBytes(client, raf, length) }
-            }
         }
-        client.getOutputStream().flush()
-    }
-
-    private fun streamBytes(client: Socket, raf: RandomAccessFile, count: Long) {
-        val output = client.getOutputStream()
-        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-        var remaining = count
-        while (remaining > 0) {
-            val toRead = minOf(remaining, buffer.size.toLong()).toInt()
-            val read = raf.read(buffer, 0, toRead)
-            if (read < 0) break
-            output.write(buffer, 0, read)
-            remaining -= read
-        }
-    }
-
-    private fun respondOptions(client: Socket, origin: String?) {
-        val output = client.getOutputStream()
-        val allowOrigin = if (origin != null && origin.startsWith("http://127.0.0.1")) origin else "*"
-        output.write(
-            ("HTTP/1.1 204 No Content\r\n" +
-                "Allow: GET, HEAD, OPTIONS\r\n" +
-                "Access-Control-Allow-Origin: $allowOrigin\r\n" +
-                "Access-Control-Allow-Methods: GET, HEAD, OPTIONS\r\n" +
-                "Access-Control-Allow-Headers: *\r\n" +
-                "Accept-Ranges: bytes\r\n" +
-                "Content-Length: 0\r\n" +
-                "Connection: close\r\n\r\n").toByteArray(Charsets.US_ASCII),
-        )
         output.flush()
     }
 
-    private fun respond(socket: Socket, status: Int, type: String, body: ByteArray, headOnly: Boolean) {
-        writeHeaders(socket, status, type, body.size.toLong(), "")
+    private fun parseRange(header: String?, length: Long): LongRange? {
+        if (header.isNullOrBlank() || length <= 0L) return null
+        val match = RANGE_REGEX.matchEntire(header.trim()) ?: return null
+        val first = match.groupValues[1]
+        val second = match.groupValues[2]
+        val start: Long
+        val end: Long
+        if (first.isBlank()) {
+            val suffixLength = second.toLongOrNull()?.coerceAtMost(length) ?: return null
+            if (suffixLength <= 0L) return null
+            start = length - suffixLength
+            end = length - 1L
+        } else {
+            start = first.toLongOrNull() ?: return null
+            end = if (second.isBlank()) length - 1L else second.toLongOrNull() ?: return null
+        }
+        if (start < 0L || start >= length || end < start) return null
+        return start..minOf(end, length - 1L)
+    }
+
+    private fun injectRuntime(html: String): String {
+        val tag = "<script src=\"/$RUNTIME_SCRIPT_PATH\"></script>"
+        if (html.contains(RUNTIME_SCRIPT_PATH)) return html
+        val head = Regex("<head(?:\\s[^>]*)?>", RegexOption.IGNORE_CASE).find(html)
+        return if (head != null) html.replaceRange(head.range.last + 1, head.range.last + 1, tag) else tag + html
+    }
+
+    private fun respondBytes(socket: Socket, status: Int, type: String, body: ByteArray, headOnly: Boolean) {
         val output = socket.getOutputStream()
+        writeHeaders(output, status, type, body.size.toLong())
         if (!headOnly) output.write(body)
         output.flush()
     }
 
-    private fun writeHeaders(socket: Socket, status: Int, type: String, contentLength: Long, extraHeaders: String) {
-        val header = buildString {
-            append("HTTP/1.1 ").append(status).append(' ').append(reasonPhrase(status)).append("\r\n")
-            append("Content-Type: ").append(type).append("\r\n")
-            append("Content-Length: ").append(contentLength).append("\r\n")
+    private fun writeHeaders(output: OutputStream, status: Int, type: String, length: Long, extra: Map<String, String> = emptyMap()) {
+        val reason = when (status) {
+            200 -> "OK"
+            206 -> "Partial Content"
+            400 -> "Bad Request"
+            404 -> "Not Found"
+            405 -> "Method Not Allowed"
+            416 -> "Range Not Satisfiable"
+            else -> "Error"
+        }
+        val headers = buildString {
+            append("HTTP/1.1 $status $reason\r\n")
+            append("Content-Type: $type\r\n")
+            append("Content-Length: $length\r\n")
             append("Cache-Control: no-cache\r\n")
             append("X-Content-Type-Options: nosniff\r\n")
-            append("Access-Control-Allow-Origin: *\r\n")
-            // Help service-worker / module scripts inside packages.
-            if (type.startsWith("text/javascript") || type.startsWith("application/javascript")) {
-                append("Cross-Origin-Resource-Policy: cross-origin\r\n")
-            }
-            if (extraHeaders.isNotEmpty()) append(extraHeaders)
+            append("Cross-Origin-Resource-Policy: cross-origin\r\n")
+            extra.forEach { (name, value) -> append("$name: $value\r\n") }
             append("Connection: close\r\n\r\n")
         }
-        socket.getOutputStream().write(header.toByteArray(Charsets.US_ASCII))
+        output.write(headers.toByteArray(Charsets.ISO_8859_1))
     }
 
-    private fun reasonPhrase(status: Int): String = when (status) {
-        200 -> "OK"
-        206 -> "Partial Content"
-        400 -> "Bad Request"
-        404 -> "Not Found"
-        405 -> "Method Not Allowed"
-        414 -> "URI Too Long"
-        else -> "Error"
+    private fun isHtml(file: File) = file.extension.equals("html", true) || file.extension.equals("htm", true)
+
+    private fun mimeType(file: File): String = when (file.extension.lowercase(Locale.ROOT)) {
+        "html", "htm" -> "text/html; charset=utf-8"
+        "css" -> "text/css; charset=utf-8"
+        "js", "mjs" -> "text/javascript; charset=utf-8"
+        "json", "map" -> "application/json; charset=utf-8"
+        "webapp" -> "application/x-web-app-manifest+json; charset=utf-8"
+        "webmanifest" -> "application/manifest+json; charset=utf-8"
+        "xml" -> "application/xml; charset=utf-8"
+        "txt" -> "text/plain; charset=utf-8"
+        "svg" -> "image/svg+xml"
+        "png" -> "image/png"
+        "jpg", "jpeg" -> "image/jpeg"
+        "gif" -> "image/gif"
+        "webp" -> "image/webp"
+        "ico" -> "image/x-icon"
+        "bmp" -> "image/bmp"
+        "mp3" -> "audio/mpeg"
+        "ogg", "oga" -> "audio/ogg"
+        "wav" -> "audio/wav"
+        "m4a", "aac" -> "audio/mp4"
+        "flac" -> "audio/flac"
+        "mp4", "m4v" -> "video/mp4"
+        "webm" -> "video/webm"
+        "ogv" -> "video/ogg"
+        "woff" -> "font/woff"
+        "woff2" -> "font/woff2"
+        "ttf" -> "font/ttf"
+        "otf" -> "font/otf"
+        "wasm" -> "application/wasm"
+        "pdf" -> "application/pdf"
+        "zip" -> "application/zip"
+        else -> "application/octet-stream"
     }
 
     override fun close() {
         running = false
-        server.close()
+        runCatching { server.close() }
         workers.shutdownNow()
     }
 
     companion object {
-        private const val MAX_REQUEST_LINE = 8_192
-        private const val MAX_HEADERS = 100
+        private const val RUNTIME_SCRIPT_PATH = "__kai_runtime__/page-runtime.js"
+        private val ALLOWED_METHODS = setOf("GET", "HEAD")
+        private val RANGE_REGEX = Regex("bytes=(\\d*)-(\\d*)", RegexOption.IGNORE_CASE)
     }
 }

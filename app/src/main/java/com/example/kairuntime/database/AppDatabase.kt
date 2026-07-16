@@ -38,6 +38,11 @@ class AppDatabase(context: Context) : SQLiteOpenHelper(context, "kai_apps.db", n
         "apps", null, null, null, null, null, "name COLLATE NOCASE",
     ).use { cursor -> buildList { while (cursor.moveToNext()) add(cursor.toApp()) } }
 
+    fun updatePort(id: String, port: Int) {
+        val values = ContentValues().apply { put("port", port) }
+        writableDatabase.update("apps", values, "id = ?", arrayOf(id))
+    }
+
     fun delete(id: String) {
         writableDatabase.delete("apps", "id = ?", arrayOf(id))
     }

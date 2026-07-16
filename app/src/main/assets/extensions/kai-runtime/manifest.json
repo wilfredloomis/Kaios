@@ -1,8 +1,8 @@
 {
   "manifest_version": 2,
   "name": "Kai Runtime Bridge",
-  "version": "0.3.0",
-  "description": "Injects the KaiOS compatibility layer (systemXHR, TCPSocket, softkeys) and connects it to Android.",
+  "version": "0.3.3",
+  "description": "Injects the KaiOS compatibility layer and connects it to Android.",
   "browser_specific_settings": {
     "gecko": {
       "id": "kai-runtime@example.com"
@@ -19,7 +19,7 @@
   },
   "content_scripts": [
     {
-      "matches": ["http://127.0.0.1/*", "http://localhost/*"],
+      "matches": ["<all_urls>"],
       "js": ["content.js"],
       "run_at": "document_start",
       "all_frames": true,
