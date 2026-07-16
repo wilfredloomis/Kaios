@@ -2,67 +2,60 @@
 
 ## Runtime flow
 
-1. `MainActivity` selects a package through Android's Storage Access Framework.
-2. `KaiPackageInstaller` extracts it into a private staging directory with strict limits.
-3. The root manifest and launch path are validated before staging is renamed into place.
-4. `AppDatabase` records metadata and a stable, app-specific localhost port.
-5. `RuntimeActivity` starts `AppHttpServer`, opens GeckoView, and installs the built-in bridge WebExtension.
-6. The WebExtension injects `page-runtime.js` at document start and forwards messages through GeckoView native messaging.
-7. Native API requests are checked against manifest and Android permissions before execution.
+1. `MainActivity` selects a ZIP through Android's Storage Access Framework.
+2. `KaiPackageInstaller` extracts it into private staging storage with traversal, binary, entry-count, single-file, and total-size checks.
+3. A KaiOS manifest or PWA manifest is normalized; wrapped single-folder archives are flattened.
+4. `AppDatabase` records metadata and a stable per-app localhost port.
+5. `RuntimeActivity` starts `AppHttpServer`, opens a configured GeckoSession, and installs the built-in bridge WebExtension.
+6. The WebExtension injects `page-runtime.js` at document start on both app and navigated web pages.
+7. Native API requests are accepted only from the installed localhost origin and checked against manifest and Android permissions.
 
-## Static file serving
+## Network model
 
-`AppHttpServer` serves package assets over loopback. Correctness details that
-matter for compatibility:
+- Normal same-origin and ordinary web requests use Gecko's native networking stack.
+- Cross-origin requests are proxied only when the installed manifest declares `systemXHR`.
+- The loopback server supports `GET`, `HEAD`, and single byte ranges.
+- Files are streamed rather than loaded entirely into memory.
+- Each installed app receives a stable unique origin, preserving separate cookies, localStorage, IndexedDB, service workers, and cache state.
 
-- Files are typed from an explicit MIME table (`HttpAssets.MIME_TYPES`). This is
-  essential because GeckoView sends `X-Content-Type-Options: nosniff`, so a
-  script served as `text/plain` is refused (the failure mode that broke real
-  KaiOS apps such as `common/js/cache.js`).
-- Directory requests fall back to `index.html`/`index.htm`.
-- `GET`/`HEAD` support single `Range` requests (`206 Partial Content` with
-  `Content-Range`) so audio and video can seek; `Accept-Ranges: bytes` is always
-  advertised.
-- `OPTIONS` returns `204` with an `Allow` header; other methods return `405`.
-- HTML responses are rewritten in memory to inject the runtime bridge script and
-  therefore never participate in range requests.
+## Browser and navigation model
 
-The pure logic (MIME typing, range parsing, path resolution, script injection)
-lives in `HttpAssets` so it can be unit-tested on the JVM without a live socket.
+- Top-level HTTP and HTTPS navigation remains inside the same GeckoSession.
+- New-window requests are redirected into the current session.
+- Non-web protocols are handed to Android through `ACTION_VIEW`.
+- Android Back uses Gecko history before closing the runtime.
+- The bridge follows top-level navigation so keypad and diagnostics still work on external web pages.
+- Privileged native KaiOS APIs remain unavailable to those external pages.
+
+## Compatibility layer
+
+The injected layer supplies:
+
+- KaiOS softkeys, D-pad, numeric keys, legacy key codes, repeat events, and a virtual Gamepad
+- Hybrid native/proxied `fetch` and `XMLHttpRequest`
+- `mozApps`, device storage, mobile connection, wake locks, audio channels, system messages
+- local IndexedDB-backed contacts
+- process-local alarms and settings
+- `MozActivity`, localization, and orientation shims
+- native battery, network, vibration, location, and notification bridge calls
+
+These are compatibility implementations, not exact replicas of privileged KaiOS system services.
 
 ## Trust boundaries
 
-- Imported files are untrusted. Canonical paths, extracted byte count, entry count, launch path, and binary extensions are checked.
-- App files are served only from the selected installation root by a loopback-only HTTP server.
-- A unique stable port creates a distinct web origin for each app, isolating localStorage and IndexedDB.
-- Messages from WebExtension content are treated as untrusted JSON and accepted only for known operations.
-- Native capabilities are denied unless the installed manifest contains the relevant permission.
-- The runtime does not expose `file://` URLs to installed content.
+- Imported package content is untrusted.
+- Canonical path validation prevents ZIP traversal and loopback-server traversal.
+- Native executable extensions are rejected.
+- Native bridge messages are untrusted JSON.
+- Privileged bridge calls require both the installed origin and a matching manifest permission.
+- Standard HTTPS pages may use normal web permissions only when the containing installed app declares the matching capability and Android grants it.
 
-## Next stages
+## Remaining high-value work
 
-1. Add hosted HTTPS manifest installation with redirect, content-type, size, and private-address validation.
-2. Add profile persistence for KaiOS 2.5, KaiOS 3.x, PWA, and custom screen settings.
-3. Add Gecko permission delegates for standard web geolocation, media, and notifications.
-4. Add per-app data clearing, orientation switching, screenshots, offline simulation, and configurable API mocks.
-5. Add contacts, alarms, device storage, camera capture, sharing, and activity handlers.
-
-
-## Network and messaging compatibility
-
-Internet-facing KaiOS packages (Telegram ports, Facebook, chat clients) typically need three
-capabilities that stock GeckoView does not provide for loopback origins:
-
-1. **Correct MIME types under `nosniff`.** Bundlers often ship scripts as `dist/main.js` or
-   extension-less chunks. `HttpAssets.mimeTypeForPath` combines extension tables, path hints
-   (`/dist/`, `/js/`), and a light content sniffer so scripts are never served as `text/plain`.
-2. **Privileged cross-origin XHR (`systemXHR`).** The page-runtime `fetch`/`XMLHttpRequest`
-   shims try the native path first, then fall back to a WebExtension background proxy that
-   is allowed for packages declaring `systemXHR`, `tcp-socket`, or `type: privileged|certified`.
-   Private / loopback targets are rejected.
-3. **Raw TCP (`navigator.mozTCPSocket`).** `TcpSocketBridge` opens real Android TCP or TLS
-   sockets and streams data back through the native-messaging port. Private hosts are blocked
-   so a package cannot scan the LAN.
-
-The runtime also advertises a KaiOS 2.5 user-agent so CDN feature detection selects the
-feature-phone layout path.
+- Persistent alarm scheduling through Android instead of in-process timers
+- Real contacts/calendar providers with per-app user consent
+- Download manager integration and save-as UI
+- Site-specific permission prompts and remembered decisions
+- Multiple screen/device profiles and orientation-aware layout
+- Web push integration, background execution, and notification click routing
+- Automated Android instrumentation tests with representative KaiOS apps

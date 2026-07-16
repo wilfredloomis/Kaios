@@ -43,7 +43,9 @@ class MainActivity : Activity() {
         super.onActivityResult(requestCode, resultCode, data)
         if (requestCode != REQUEST_PACKAGE || resultCode != RESULT_OK) return
         val uri = data?.data ?: return
-        contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        runCatching {
+            contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
         install(uri)
     }
 
@@ -149,7 +151,10 @@ class MainActivity : Activity() {
                 typeface = Typeface.DEFAULT_BOLD
             })
             addView(TextView(this@MainActivity).apply {
-                text = listOfNotNull("Packaged", app.version).joinToString("  •  ")
+                text = listOfNotNull(
+                    app.appType.replaceFirstChar { character -> character.uppercase() },
+                    app.version,
+                ).joinToString("  •  ")
                 setTextColor(MUTED)
                 textSize = 13f
             })
@@ -179,7 +184,12 @@ class MainActivity : Activity() {
     private fun choosePackage() {
         startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
-            type = "application/zip"
+            type = "*/*"
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                "application/zip",
+                "application/x-zip-compressed",
+                "application/octet-stream",
+            ))
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
         }, REQUEST_PACKAGE)
     }

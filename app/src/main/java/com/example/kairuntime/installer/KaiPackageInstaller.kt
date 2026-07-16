@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import com.example.kairuntime.database.AppDatabase
 import com.example.kairuntime.database.InstalledKaiApp
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
@@ -23,22 +24,33 @@ class KaiPackageInstaller(private val context: Context) {
                 ZipInputStream(input.buffered()).use { zip -> extract(zip, staging) }
             } ?: error("The selected package could not be opened")
 
-            val manifestFile = File(staging, MANIFEST_NAME)
-            require(manifestFile.isFile) { "manifest.webapp must be at the ZIP root" }
-            val manifest = JSONObject(manifestFile.readText(Charsets.UTF_8))
-            val name = manifest.optString("name").trim()
+            flattenSingleTopLevelDirectory(staging)
+            val sourceManifest = findManifest(staging)
+            val manifest = JSONObject(sourceManifest.readText(Charsets.UTF_8))
+            val isPwaManifest = sourceManifest.name != MANIFEST_NAME
+            val name = manifest.optString("name").ifBlank { manifest.optString("short_name") }.trim()
             require(name.isNotEmpty()) { "Manifest name is required" }
 
-            val launchPath = PackageSafety.normalizeManifestPath(manifest.optString("launch_path", "/index.html"))
-            require(File(staging, launchPath).isFile) { "launch_path does not point to a file" }
+            val rawLaunchPath = if (isPwaManifest) {
+                manifest.optString("start_url", "/index.html").substringBefore('?').substringBefore('#')
+            } else {
+                manifest.optString("launch_path", "/index.html")
+            }
+            val launchPath = PackageSafety.normalizeManifestPath(rawLaunchPath)
+            require(File(staging, launchPath).isFile) { "launch/start path does not point to a file: $launchPath" }
             val iconPath = selectIcon(manifest)?.let(PackageSafety::normalizeManifestPath)?.takeIf {
                 File(staging, it).isFile
             }
             val permissions = manifest.optJSONObject("permissions") ?: JSONObject()
-            // Persist the KaiOS app type (web / privileged / certified) so the
-            // runtime can unlock systemXHR / TCP for privileged packages.
-            val manifestType = manifest.optString("type", "web").trim().ifBlank { "web" }.lowercase()
-            permissions.put("_appType", manifestType)
+
+            // The compatibility runtime and legacy applications always expect this canonical path.
+            val canonicalManifest = File(staging, MANIFEST_NAME)
+            if (sourceManifest != canonicalManifest) {
+                val normalized = JSONObject(manifest.toString())
+                    .put("name", name)
+                    .put("launch_path", "/$launchPath")
+                canonicalManifest.writeText(normalized.toString(), Charsets.UTF_8)
+            }
 
             val installation = File(appsRoot, id)
             check(staging.renameTo(installation)) { "Could not finalize installation" }
@@ -50,7 +62,7 @@ class KaiPackageInstaller(private val context: Context) {
                 manifestPath = File(installation, MANIFEST_NAME).absolutePath,
                 iconPath = iconPath?.let { File(installation, it).absolutePath },
                 installationPath = installation.absolutePath,
-                appType = manifestType,
+                appType = if (isPwaManifest) "pwa" else manifest.optString("type", "packaged").ifBlank { "packaged" },
                 permissionsJson = permissions.toString(),
                 port = allocatePort(),
             )
@@ -75,23 +87,29 @@ class KaiPackageInstaller(private val context: Context) {
         while (entry != null) {
             entries++
             require(entries <= MAX_ENTRIES) { "Package contains too many files" }
-            val relative = PackageSafety.normalizeZipEntry(entry.name.trimEnd('/'))
-            PackageSafety.rejectNativeBinary(relative)
-            val output = File(root, relative).canonicalFile
-            require(output.path.startsWith(root.path + File.separator)) { "Unsafe ZIP path" }
-            if (entry.isDirectory) {
-                require(output.mkdirs() || output.isDirectory) { "Could not create directory" }
-            } else {
-                val parent = requireNotNull(output.parentFile)
-                require(parent.mkdirs() || parent.isDirectory) { "Could not create directory" }
-                FileOutputStream(output).use { stream ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    while (true) {
-                        val count = zip.read(buffer)
-                        if (count < 0) break
-                        totalBytes += count
-                        require(totalBytes <= MAX_EXTRACTED_BYTES) { "Package exceeds 50 MB" }
-                        stream.write(buffer, 0, count)
+            val trimmedName = entry.name.trimEnd('/')
+            if (trimmedName.isNotBlank()) {
+                val relative = PackageSafety.normalizeZipEntry(trimmedName)
+                PackageSafety.rejectNativeBinary(relative)
+                val output = File(root, relative).canonicalFile
+                require(output.path.startsWith(root.path + File.separator)) { "Unsafe ZIP path" }
+                if (entry.isDirectory) {
+                    require(output.mkdirs() || output.isDirectory) { "Could not create directory" }
+                } else {
+                    val parent = requireNotNull(output.parentFile)
+                    require(parent.mkdirs() || parent.isDirectory) { "Could not create directory" }
+                    var entryBytes = 0L
+                    FileOutputStream(output).use { stream ->
+                        val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                        while (true) {
+                            val count = zip.read(buffer)
+                            if (count < 0) break
+                            entryBytes += count
+                            totalBytes += count
+                            require(entryBytes <= MAX_SINGLE_FILE_BYTES) { "A package file exceeds 100 MB" }
+                            require(totalBytes <= MAX_EXTRACTED_BYTES) { "Package exceeds 250 MB" }
+                            stream.write(buffer, 0, count)
+                        }
                     }
                 }
             }
@@ -100,20 +118,63 @@ class KaiPackageInstaller(private val context: Context) {
         }
     }
 
-    private fun selectIcon(manifest: JSONObject): String? {
-        val icons = manifest.optJSONObject("icons") ?: return null
-        return icons.keys().asSequence()
-            .mapNotNull { size -> size.toIntOrNull()?.let { it to icons.optString(size) } }
-            .filter { it.second.isNotBlank() }
-            .maxByOrNull { it.first }
-            ?.second
+    private fun flattenSingleTopLevelDirectory(staging: File) {
+        if (MANIFEST_CANDIDATES.any { File(staging, it).isFile }) return
+        val children = staging.listFiles().orEmpty().filterNot { it.name.startsWith("__MACOSX") }
+        if (children.size != 1 || !children.single().isDirectory) return
+        val nested = children.single()
+        if (MANIFEST_CANDIDATES.none { File(nested, it).isFile }) return
+        nested.listFiles().orEmpty().forEach { child ->
+            val target = File(staging, child.name)
+            check(child.renameTo(target)) { "Could not normalize package root" }
+        }
+        nested.delete()
     }
 
-    private fun allocatePort(): Int = ServerSocket(0).use { it.localPort }
+    private fun findManifest(root: File): File {
+        return MANIFEST_CANDIDATES.asSequence()
+            .map { File(root, it) }
+            .firstOrNull(File::isFile)
+            ?: error("Package must contain manifest.webapp, manifest.webmanifest, or manifest.json at its root")
+    }
+
+    private fun selectIcon(manifest: JSONObject): String? {
+        val icons = manifest.opt("icons") ?: return null
+        return when (icons) {
+            is JSONObject -> icons.keys().asSequence()
+                .mapNotNull { size -> size.toIntOrNull()?.let { it to icons.optString(size) } }
+                .filter { it.second.isNotBlank() }
+                .maxByOrNull { it.first }
+                ?.second
+            is JSONArray -> (0 until icons.length()).asSequence()
+                .mapNotNull { icons.optJSONObject(it) }
+                .mapNotNull { icon ->
+                    val src = icon.optString("src").takeIf(String::isNotBlank) ?: return@mapNotNull null
+                    val largest = Regex("(\\d+)x(\\d+)").findAll(icon.optString("sizes"))
+                        .mapNotNull { match -> match.groupValues.getOrNull(1)?.toIntOrNull() }
+                        .maxOrNull() ?: 0
+                    largest to src
+                }
+                .maxByOrNull { it.first }
+                ?.second
+            else -> null
+        }
+    }
+
+    private fun allocatePort(): Int {
+        val usedPorts = AppDatabase(context).use { database -> database.getAll().mapTo(mutableSetOf()) { it.port } }
+        repeat(64) {
+            val candidate = ServerSocket(0).use { it.localPort }
+            if (candidate !in usedPorts) return candidate
+        }
+        error("Could not allocate a unique localhost port")
+    }
 
     companion object {
         const val MANIFEST_NAME = "manifest.webapp"
-        const val MAX_ENTRIES = 2_000
-        const val MAX_EXTRACTED_BYTES = 50L * 1024 * 1024
+        private val MANIFEST_CANDIDATES = listOf(MANIFEST_NAME, "manifest.webmanifest", "manifest.json")
+        const val MAX_ENTRIES = 10_000
+        const val MAX_EXTRACTED_BYTES = 250L * 1024 * 1024
+        const val MAX_SINGLE_FILE_BYTES = 100L * 1024 * 1024
     }
 }

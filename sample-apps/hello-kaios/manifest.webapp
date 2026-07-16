@@ -1,14 +1,11 @@
 {
   "name": "Hello KaiOS",
-  "description": "Runtime, keypad, network and API smoke test",
-  "version": "1.1.0",
-  "type": "privileged",
+  "description": "Runtime, keypad and API smoke test",
+  "version": "1.0.0",
   "launch_path": "/index.html",
   "permissions": {
     "vibration": {},
     "geolocation": {},
-    "desktop-notification": {},
-    "systemXHR": {},
-    "tcp-socket": {}
+    "desktop-notification": {}
   }
 }

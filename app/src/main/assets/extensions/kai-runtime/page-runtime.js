@@ -5,32 +5,43 @@
   let sequence = 0;
   const pending = new Map();
   const networkPending = new Map();
-  const tcpSockets = new Map();
   const nativeFetch = window.fetch.bind(window);
-  let networkEnabled = true;
-  let privilegedHint = false;
+  const NativeXMLHttpRequest = window.XMLHttpRequest;
 
-  // ---------------------------------------------------------------------------
-  // Manifest inspection – systemXHR / privileged / tcp-socket unlock network
-  // ---------------------------------------------------------------------------
+  function defineEventHandlerProperties(prototype, types) {
+    types.forEach(type => {
+      const callbackKey = Symbol(`on${type}`);
+      const listenerKey = Symbol(`on${type}Listener`);
+      Object.defineProperty(prototype, `on${type}`, {
+        configurable: true,
+        enumerable: true,
+        get() { return this[callbackKey] || null; },
+        set(callback) {
+          const previous = this[listenerKey];
+          if (previous) this.removeEventListener(type, previous);
+          this[callbackKey] = typeof callback === "function" ? callback : null;
+          this[listenerKey] = null;
+          if (this[callbackKey]) {
+            const listener = event => this[callbackKey] && this[callbackKey].call(this, event);
+            this[listenerKey] = listener;
+            this.addEventListener(type, listener);
+          }
+        }
+      });
+    });
+  }
+
+  const XHR_EVENT_TYPES = ["readystatechange", "loadstart", "progress", "abort", "error", "load", "timeout", "loadend"];
+  const PROGRESS_EVENT_TYPES = ["loadstart", "progress", "abort", "error", "load", "timeout", "loadend"];
+
+  class CompatibleXMLHttpRequestUpload extends EventTarget {}
+  defineEventHandlerProperties(CompatibleXMLHttpRequestUpload.prototype, PROGRESS_EVENT_TYPES);
+
   const manifestPromise = nativeFetch("/manifest.webapp", { cache: "no-store" })
-    .then(response => (response.ok ? response.json() : {}))
+    .then(response => response.ok ? response.json() : {})
     .catch(() => ({}));
-
-  const systemXhrAllowed = manifestPromise.then(manifest => {
-    const permissions = manifest.permissions || {};
-    const keys = Object.keys(permissions).map(k => k.toLowerCase());
-    const type = String(manifest.type || "").toLowerCase();
-    privilegedHint = type === "privileged" || type === "certified";
-    return (
-      privilegedHint ||
-      keys.includes("systemxhr") ||
-      keys.includes("tcp-socket") ||
-      keys.includes("network-tcp") ||
-      keys.includes("mobileconnection") ||
-      keys.includes("wifi-manage")
-    );
-  }).catch(() => false);
+  const systemXhrAllowed = manifestPromise
+    .then(manifest => Object.keys(manifest.permissions || {}).some(name => name.toLowerCase() === "systemxhr"));
 
   function arrayBufferToBase64(buffer) {
     const bytes = new Uint8Array(buffer);
@@ -47,9 +58,6 @@
     return Uint8Array.from(binary, character => character.charCodeAt(0));
   }
 
-  // ---------------------------------------------------------------------------
-  // Cross-origin network proxy (systemXHR)
-  // ---------------------------------------------------------------------------
   document.addEventListener("kai-network-response", event => {
     const detail = event.detail || {};
     const callback = networkPending.get(detail.id);
@@ -61,10 +69,6 @@
 
   function proxyNetworkRequest(detail) {
     return new Promise((resolve, reject) => {
-      if (!networkEnabled) {
-        reject(new TypeError("Network is disabled (offline simulation)"));
-        return;
-      }
       networkPending.set(detail.id, { resolve, reject });
       document.dispatchEvent(new CustomEvent("kai-network-request", { detail }));
       setTimeout(() => {
@@ -72,48 +76,25 @@
         if (!callback) return;
         networkPending.delete(detail.id);
         callback.reject(new TypeError("Proxied network request timed out"));
-      }, 45000);
+      }, 60000);
     });
   }
 
   async function compatibleFetch(input, init) {
     const request = new Request(input, init);
     const target = new URL(request.url, location.href);
-
-    // Same-origin, non-http(s), or offline simulation → native path.
-    if (target.origin === location.origin || !/^https?:$/.test(target.protocol)) {
-      return nativeFetch(input, init);
-    }
-    if (!networkEnabled) throw new TypeError("Failed to fetch (network disabled)");
-
-    // Always try native first – Gecko may allow CORS if the remote sends headers.
-    // Fall back to the privileged proxy for apps that declared systemXHR / privileged.
-    try {
-      const nativeResponse = await nativeFetch(input, init);
-      // Opaque / opaque-redirect responses from no-cors mode are useless for XHR;
-      // if the caller used cors mode and we got a real response, return it.
-      if (nativeResponse.type !== "opaque" && nativeResponse.type !== "opaqueredirect") {
-        return nativeResponse;
-      }
-    } catch (_) {
-      // CORS or network failure – try proxy if allowed.
-    }
-
-    if (!(await systemXhrAllowed)) {
+    if (target.origin === location.origin || !/^https?:$/.test(target.protocol) || !(await systemXhrAllowed)) {
       return nativeFetch(input, init);
     }
 
     let bodyBase64 = null;
     if (request.method !== "GET" && request.method !== "HEAD") {
       const body = await request.clone().arrayBuffer();
-      if (body.byteLength > 8 * 1024 * 1024) throw new TypeError("Network request exceeds 8 MB");
+      if (body.byteLength > 16 * 1024 * 1024) throw new TypeError("Network request exceeds 16 MB");
       bodyBase64 = arrayBufferToBase64(body);
     }
     const headers = {};
     request.headers.forEach((value, name) => { headers[name] = value; });
-    // Ensure a KaiOS-like Accept default so CDNs don't 406.
-    if (!headers.accept && !headers.Accept) headers["Accept"] = "*/*";
-
     const result = await proxyNetworkRequest({
       id: `network-${Date.now()}-${++sequence}`,
       url: target.href,
@@ -121,7 +102,8 @@
       headers,
       bodyBase64,
       credentials: request.credentials,
-      cache: request.cache
+      cache: request.cache,
+      redirect: request.redirect
     });
     const response = new Response(base64ToBytes(result.bodyBase64), {
       status: result.status,
@@ -134,9 +116,6 @@
 
   Object.defineProperty(window, "fetch", { configurable: true, writable: true, value: compatibleFetch });
 
-  // ---------------------------------------------------------------------------
-  // XMLHttpRequest shim (routes through compatibleFetch)
-  // ---------------------------------------------------------------------------
   class CompatibleXMLHttpRequest extends EventTarget {
     constructor() {
       super();
@@ -150,38 +129,102 @@
       this.responseURL = "";
       this.timeout = 0;
       this.withCredentials = false;
-      this.upload = new EventTarget();
+      this.upload = new CompatibleXMLHttpRequestUpload();
       this._headers = {};
       this._responseHeaders = new Headers();
       this._controller = null;
+      this._native = null;
+      this._mimeType = null;
+      this._sent = false;
+      this._async = true;
     }
 
-    open(method, url, async = true) {
-      if (async === false) throw new DOMException("Synchronous XHR is not supported", "NotSupportedError");
+    open(method, url, async = true, user, password) {
       this._method = String(method).toUpperCase();
       this._url = new URL(url, location.href).href;
+      this._async = async !== false;
+      this._user = user;
+      this._password = password;
       this.readyState = 1;
       this._emit("readystatechange");
+      if (!this._async) {
+        this._createNative();
+        this._native.open(this._method, this._url, false, user, password);
+      }
     }
 
     setRequestHeader(name, value) {
-      if (this.readyState !== 1) throw new DOMException("XHR is not open", "InvalidStateError");
+      if (this.readyState !== 1 || this._sent) throw new DOMException("XHR is not open", "InvalidStateError");
       const key = String(name).toLowerCase();
       this._headers[key] = this._headers[key] ? `${this._headers[key]}, ${value}` : String(value);
+      if (this._native) this._native.setRequestHeader(name, value);
     }
 
     async send(body = null) {
-      if (this.readyState !== 1) throw new DOMException("XHR is not open", "InvalidStateError");
+      if (this.readyState !== 1 || this._sent) throw new DOMException("XHR is not open", "InvalidStateError");
+      this._sent = true;
+      if (!this._async) {
+        this._prepareNative();
+        this._native.send(body);
+        this._syncNative();
+        return;
+      }
+      const target = new URL(this._url, location.href);
+      const useProxy = target.origin !== location.origin && /^https?:$/.test(target.protocol) && await systemXhrAllowed;
+      if (!useProxy) {
+        this._sendNative(body);
+        return;
+      }
+      this._sendProxy(body);
+    }
+
+    _createNative() {
+      if (this._native) return;
+      const native = new NativeXMLHttpRequest();
+      this._native = native;
+      XHR_EVENT_TYPES.forEach(type => native.addEventListener(type, event => {
+        this._syncNative();
+        this._emit(type, event);
+      }));
+      PROGRESS_EVENT_TYPES.forEach(type => {
+        native.upload.addEventListener(type, event => this.upload.dispatchEvent(new ProgressEvent(type, {
+          lengthComputable: event.lengthComputable,
+          loaded: event.loaded,
+          total: event.total
+        })));
+      });
+    }
+
+    _prepareNative() {
+      this._native.responseType = this.responseType;
+      this._native.timeout = this.timeout;
+      this._native.withCredentials = this.withCredentials;
+      if (this._mimeType) this._native.overrideMimeType(this._mimeType);
+    }
+
+    _sendNative(body) {
+      this._createNative();
+      this._native.open(this._method, this._url, true, this._user, this._password);
+      Object.entries(this._headers).forEach(([name, value]) => this._native.setRequestHeader(name, value));
+      this._prepareNative();
+      this._native.send(body);
+    }
+
+    async _sendProxy(body) {
       this._controller = new AbortController();
       let timeoutId = null;
-      if (this.timeout > 0) timeoutId = setTimeout(() => this._controller.abort("timeout"), this.timeout);
+      let timedOut = false;
+      if (this.timeout > 0) timeoutId = setTimeout(() => {
+        timedOut = true;
+        this._controller.abort();
+      }, this.timeout);
       this._emit("loadstart");
       try {
         const response = await compatibleFetch(this._url, {
           method: this._method,
           headers: this._headers,
           body: this._method === "GET" || this._method === "HEAD" ? undefined : body,
-          credentials: this.withCredentials ? "include" : "same-origin",
+          credentials: this.withCredentials ? "include" : "omit",
           signal: this._controller.signal
         });
         this.status = response.status;
@@ -193,8 +236,8 @@
         const buffer = await response.arrayBuffer();
         this.readyState = 3;
         this._emit("readystatechange");
-        this._emit("progress");
-        const contentType = response.headers.get("content-type") || "";
+        this._emit("progress", new ProgressEvent("progress", { lengthComputable: true, loaded: buffer.byteLength, total: buffer.byteLength }));
+        const contentType = this._mimeType || response.headers.get("content-type") || "";
         const text = new TextDecoder().decode(buffer);
         if (this.responseType === "arraybuffer") this.response = buffer;
         else if (this.responseType === "blob") this.response = new Blob([buffer], { type: contentType });
@@ -217,35 +260,64 @@
         this.readyState = 4;
         this.status = 0;
         this._emit("readystatechange");
-        this._emit(error && error.name === "AbortError" && this.timeout > 0 ? "timeout" : "error");
+        this._emit(timedOut ? "timeout" : (error && error.name === "AbortError" ? "abort" : "error"));
         this._emit("loadend");
       } finally {
         if (timeoutId !== null) clearTimeout(timeoutId);
       }
     }
 
-    abort() {
-      if (this._controller) this._controller.abort();
-      this.readyState = 0;
-      this._emit("abort");
-      this._emit("loadend");
+    _syncNative() {
+      if (!this._native) return;
+      this.readyState = this._native.readyState;
+      this.status = this._native.status;
+      this.statusText = this._native.statusText;
+      this.responseURL = this._native.responseURL;
+      this.response = this._native.response;
+      this.responseXML = this._native.responseXML;
+      try { this.responseText = this._native.responseText; } catch (_) { this.responseText = ""; }
     }
 
-    getResponseHeader(name) { return this._responseHeaders.get(name); }
+    abort() {
+      if (this._native) this._native.abort();
+      if (this._controller) this._controller.abort();
+      if (!this._native) {
+        this.readyState = 0;
+        this._emit("abort");
+        this._emit("loadend");
+      }
+    }
+
+    getResponseHeader(name) {
+      if (this._native) return this._native.getResponseHeader(name);
+      return this._responseHeaders.get(name);
+    }
+
     getAllResponseHeaders() {
+      if (this._native) return this._native.getAllResponseHeaders();
       let result = "";
       this._responseHeaders.forEach((value, name) => { result += `${name}: ${value}\r\n`; });
       return result;
     }
-    overrideMimeType() {}
-    _emit(type) {
-      const event = new Event(type);
+
+    overrideMimeType(value) {
+      this._mimeType = String(value);
+      if (this._native) this._native.overrideMimeType(this._mimeType);
+    }
+
+    _emit(type, source) {
+      const event = source && typeof source.loaded === "number"
+        ? new ProgressEvent(type, {
+            lengthComputable: Boolean(source.lengthComputable),
+            loaded: Number(source.loaded) || 0,
+            total: Number(source.total) || 0
+          })
+        : new Event(type);
       this.dispatchEvent(event);
-      const handler = this[`on${type}`];
-      if (typeof handler === "function") handler.call(this, event);
     }
   }
 
+  defineEventHandlerProperties(CompatibleXMLHttpRequest.prototype, XHR_EVENT_TYPES);
   Object.assign(CompatibleXMLHttpRequest, { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 });
   Object.assign(CompatibleXMLHttpRequest.prototype, { UNSENT: 0, OPENED: 1, HEADERS_RECEIVED: 2, LOADING: 3, DONE: 4 });
   Object.defineProperty(window, "XMLHttpRequest", {
@@ -254,183 +326,15 @@
     value: CompatibleXMLHttpRequest
   });
 
-  // ---------------------------------------------------------------------------
-  // mozTCPSocket – Firefox OS / KaiOS raw TCP (used by Telegram ports)
-  // ---------------------------------------------------------------------------
-  document.addEventListener("kai-tcp-event", event => {
-    const detail = event.detail || {};
-    const socket = tcpSockets.get(detail.socketId);
-    if (!socket) return;
-    const data = detail.data || {};
-    switch (detail.event) {
-      case "open":
-      case "opened":
-        socket.readyState = "open";
-        socket._emit("open");
-        break;
-      case "data": {
-        let payload;
-        if (data.dataBase64) {
-          const bytes = base64ToBytes(data.dataBase64);
-          payload = socket.binaryType === "arraybuffer" ? bytes.buffer : new TextDecoder().decode(bytes);
-        } else {
-          payload = data.text || "";
-        }
-        socket._emit("data", { data: payload });
-        break;
-      }
-      case "error":
-        socket._emit("error", { data: new Error(data.message || "TCP error"), message: data.message });
-        break;
-      case "close":
-        socket.readyState = "closed";
-        socket._emit("close");
-        tcpSockets.delete(detail.socketId);
-        break;
-      default:
-        break;
-    }
-  });
-
-  function createTCPSocket(host, port, options) {
-    options = options || {};
-    const binaryType = options.binaryType === "arraybuffer" ? "arraybuffer" : "string";
-    const useSecureTransport = Boolean(options.useSecureTransport);
-    const requestId = `tcp-${Date.now()}-${++sequence}`;
-    const socket = {
-      host: String(host),
-      port: Number(port),
-      ssl: useSecureTransport,
-      binaryType,
-      bufferedAmount: 0,
-      readyState: "connecting",
-      onopen: null,
-      ondata: null,
-      onerror: null,
-      onclose: null,
-      _listeners: { open: [], data: [], error: [], close: [] },
-      _socketId: null,
-      addEventListener(type, listener) {
-        if (this._listeners[type]) this._listeners[type].push(listener);
-      },
-      removeEventListener(type, listener) {
-        if (!this._listeners[type]) return;
-        this._listeners[type] = this._listeners[type].filter(l => l !== listener);
-      },
-      _emit(type, extra) {
-        const event = Object.assign({ type, target: this }, extra || {});
-        const handler = this[`on${type}`];
-        if (typeof handler === "function") {
-          try { handler.call(this, event); } catch (e) { console.error(e); }
-        }
-        (this._listeners[type] || []).forEach(listener => {
-          try { listener.call(this, event); } catch (e) { console.error(e); }
-        });
-      },
-      send(data) {
-        if (this.readyState !== "open" || this._socketId == null) {
-          throw new DOMException("TCPSocket is not open", "InvalidStateError");
-        }
-        const message = {
-          type: "tcp",
-          action: "send",
-          socketId: this._socketId
-        };
-        if (typeof data === "string") {
-          message.text = data;
-        } else if (data instanceof ArrayBuffer) {
-          message.dataBase64 = arrayBufferToBase64(data);
-        } else if (ArrayBuffer.isView(data)) {
-          message.dataBase64 = arrayBufferToBase64(data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength));
-        } else {
-          message.text = String(data);
-        }
-        document.dispatchEvent(new CustomEvent("kai-tcp-request", { detail: message }));
-        return true;
-      },
-      suspend() {},
-      resume() {},
-      close() {
-        if (this._socketId != null) {
-          document.dispatchEvent(new CustomEvent("kai-tcp-request", {
-            detail: { type: "tcp", action: "close", socketId: this._socketId }
-          }));
-        }
-        this.readyState = "closing";
-      }
-    };
-
-    // Temporary id until Android assigns a real one via "opened" event.
-    // We track by requestId first, then re-key on socketId.
-    const pendingKey = requestId;
-    tcpSockets.set(pendingKey, socket);
-
-    document.addEventListener("kai-tcp-event", function onOpened(event) {
-      const detail = event.detail || {};
-      if (detail.requestId !== requestId && detail.event !== "opened" && detail.event !== "open") return;
-      if (detail.requestId && detail.requestId !== requestId) return;
-      if (detail.event === "opened" || detail.event === "open") {
-        if (detail.requestId && detail.requestId !== requestId) return;
-        // Accept first opened after our request if requestId matches, or if we
-        // haven't been assigned yet and this is the only connecting socket.
-        if (socket._socketId != null) return;
-        if (detail.requestId === requestId || (!detail.requestId && socket.readyState === "connecting")) {
-          socket._socketId = detail.socketId;
-          tcpSockets.delete(pendingKey);
-          tcpSockets.set(detail.socketId, socket);
-          document.removeEventListener("kai-tcp-event", onOpened);
-        }
-      }
-      if (detail.event === "error" && detail.requestId === requestId) {
-        socket.readyState = "closed";
-        socket._emit("error", { data: new Error((detail.data && detail.data.message) || "TCP open failed") });
-        socket._emit("close");
-        tcpSockets.delete(pendingKey);
-        document.removeEventListener("kai-tcp-event", onOpened);
-      }
-    });
-
-    document.dispatchEvent(new CustomEvent("kai-tcp-request", {
-      detail: {
-        type: "tcp",
-        action: "open",
-        requestId,
-        host: String(host),
-        port: Number(port),
-        useSecureTransport,
-        binaryType
-      }
-    }));
-
-    return socket;
-  }
-
-  // navigator.mozTCPSocket.open(host, port, options)
-  const mozTCPSocket = {
-    open: createTCPSocket,
-    listen() {
-      throw new DOMException("TCPSocket.listen is not supported in Kai Runtime", "NotSupportedError");
-    }
-  };
-  Object.defineProperty(navigator, "mozTCPSocket", {
-    configurable: true,
-    enumerable: true,
-    value: mozTCPSocket
-  });
-  // Some ports check window.TCPSocket or navigator.TCPSocket.
-  if (!window.TCPSocket) {
-    Object.defineProperty(window, "TCPSocket", { configurable: true, value: mozTCPSocket });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Audio / media compatibility
-  // ---------------------------------------------------------------------------
+  const trackedAudioContexts = new Set();
   const NativeAudioContext = window.AudioContext || window.webkitAudioContext;
   if (NativeAudioContext) {
     function CompatibleAudioContext(options) {
-      return options && typeof options === "object"
+      const context = options && typeof options === "object"
         ? new NativeAudioContext(options)
         : new NativeAudioContext();
+      trackedAudioContexts.add(context);
+      return context;
     }
     CompatibleAudioContext.prototype = NativeAudioContext.prototype;
     Object.setPrototypeOf(CompatibleAudioContext, NativeAudioContext);
@@ -443,6 +347,260 @@
       Object.defineProperty(window, "webkitAudioContext", { configurable: true, value: CompatibleAudioContext });
     }
   }
+
+  // Media compatibility -----------------------------------------------------
+  // A number of KaiOS applications rely on old hls.js behavior and muted
+  // autoplay. Android Gecko correctly blocks audible autoplay until a trusted
+  // page gesture, so provide a real in-page sound button rather than trying to
+  // unlock audio from a synthetic native-message event.
+  const hlsConstructorCache = new WeakMap();
+  const hlsInstanceCache = new WeakMap();
+  let soundRecoveryUntil = 0;
+  let soundButton = null;
+
+  function wrapHlsInstance(instance) {
+    if (!instance || (typeof instance !== "object" && typeof instance !== "function")) return instance;
+    try { if (instance.__kaiHlsCompatProxy) return instance; } catch (_) {}
+    if (hlsInstanceCache.has(instance)) return hlsInstanceCache.get(instance);
+    let proxy;
+    const callableLoadLevel = function (levelOrSource) {
+      if (arguments.length === 0) return Reflect.get(instance, "loadLevel", instance);
+      if (typeof levelOrSource === "string" && typeof instance.loadSource === "function") {
+        instance.loadSource(levelOrSource);
+      } else {
+        const level = Number(levelOrSource);
+        if (Number.isFinite(level)) Reflect.set(instance, "loadLevel", level, instance);
+      }
+      if (typeof instance.startLoad === "function") instance.startLoad();
+      return proxy;
+    };
+    proxy = new Proxy(instance, {
+      get(target, property) {
+        if (property === "__kaiHlsCompatProxy") return true;
+        const value = Reflect.get(target, property, target);
+        if (property === "loadLevel" && typeof value !== "function") return callableLoadLevel;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+      set(target, property, value) {
+        return Reflect.set(target, property, value, target);
+      }
+    });
+    hlsInstanceCache.set(instance, proxy);
+    return proxy;
+  }
+
+  function wrapHlsConstructor(Constructor) {
+    if (typeof Constructor !== "function") return Constructor;
+    if (hlsConstructorCache.has(Constructor)) return hlsConstructorCache.get(Constructor);
+    const wrapped = new Proxy(Constructor, {
+      construct(target, argumentsList) {
+        return wrapHlsInstance(Reflect.construct(target, argumentsList, target));
+      },
+      apply(target, thisArgument, argumentsList) {
+        return wrapHlsInstance(Reflect.apply(target, thisArgument, argumentsList));
+      }
+    });
+    hlsConstructorCache.set(Constructor, wrapped);
+    return wrapped;
+  }
+
+  function installHlsGlobalCompatibility(name, constructorMode) {
+    const descriptor = Object.getOwnPropertyDescriptor(window, name);
+    if (descriptor && !descriptor.configurable) return;
+    let currentValue = descriptor && "value" in descriptor ? descriptor.value : window[name];
+    Object.defineProperty(window, name, {
+      configurable: true,
+      enumerable: descriptor ? descriptor.enumerable : true,
+      get() {
+        return constructorMode ? wrapHlsConstructor(currentValue) : wrapHlsInstance(currentValue);
+      },
+      set(value) { currentValue = value; }
+    });
+  }
+
+  try {
+    installHlsGlobalCompatibility("Hls", true);
+    installHlsGlobalCompatibility("hls", false);
+  } catch (_) {
+    // Some sites define non-configurable globals. Their native behavior remains.
+  }
+
+  function allMediaElements(root = document) {
+    const found = [];
+    const visit = node => {
+      if (!node || typeof node.querySelectorAll !== "function") return;
+      node.querySelectorAll("audio,video").forEach(media => found.push(media));
+      node.querySelectorAll("*").forEach(element => {
+        if (element.shadowRoot) visit(element.shadowRoot);
+      });
+    };
+    visit(root);
+    return found;
+  }
+
+  function mediaNeedsSound(media) {
+    return Boolean(media && !media.ended && (media.muted || media.defaultMuted || Number(media.volume) <= 0.001));
+  }
+
+  function resumeTrackedAudioContexts() {
+    trackedAudioContexts.forEach(context => {
+      if (context && context.state === "suspended" && typeof context.resume === "function") {
+        Promise.resolve(context.resume()).catch(() => {});
+      }
+    });
+  }
+
+  function forceMediaSound() {
+    resumeTrackedAudioContexts();
+    for (const media of allMediaElements()) {
+      try { media.removeAttribute("muted"); } catch (_) {}
+      try { media.defaultMuted = false; } catch (_) {}
+      try { media.muted = false; } catch (_) {}
+      try { if (!Number.isFinite(media.volume) || media.volume <= 0.001) media.volume = 1; } catch (_) {}
+      if (media.paused && media.autoplay && media.readyState > 0 && typeof media.play === "function") {
+        Promise.resolve(media.play()).catch(() => {});
+      }
+    }
+  }
+
+  function hideSoundButton() {
+    if (soundButton && soundButton.isConnected) soundButton.remove();
+    soundButton = null;
+  }
+
+  function requestSoundRecovery() {
+    soundRecoveryUntil = performance.now() + 4000;
+    logToAndroid({ type: "console", level: "log", message: "Media sound unlock requested" });
+    forceMediaSound();
+    [80, 250, 700, 1500, 3000].forEach(delay => setTimeout(() => {
+      if (performance.now() <= soundRecoveryUntil) forceMediaSound();
+    }, delay));
+    setTimeout(() => {
+      const stillMuted = allMediaElements().some(mediaNeedsSound);
+      if (!stillMuted) hideSoundButton();
+    }, 500);
+  }
+
+  function ensureSoundButton() {
+    if (soundButton && soundButton.isConnected) return;
+    const parent = document.body || document.documentElement;
+    if (!parent) return;
+    soundButton = document.createElement("button");
+    soundButton.type = "button";
+    soundButton.textContent = "🔊 Enable sound";
+    soundButton.setAttribute("aria-label", "Enable sound for this app");
+    Object.assign(soundButton.style, {
+      all: "initial",
+      position: "fixed",
+      right: "10px",
+      bottom: "64px",
+      zIndex: "2147483647",
+      display: "block",
+      boxSizing: "border-box",
+      padding: "10px 14px",
+      border: "1px solid rgba(255,255,255,.35)",
+      borderRadius: "18px",
+      background: "rgba(18,25,22,.94)",
+      color: "#fff",
+      font: "600 14px sans-serif",
+      lineHeight: "20px",
+      boxShadow: "0 2px 10px rgba(0,0,0,.45)",
+      cursor: "pointer",
+      pointerEvents: "auto",
+      userSelect: "none"
+    });
+    soundButton.addEventListener("click", event => {
+      event.preventDefault();
+      event.stopPropagation();
+      requestSoundRecovery();
+    }, true);
+    parent.appendChild(soundButton);
+  }
+
+  function inspectMediaSound() {
+    const mutedPlayback = allMediaElements().some(media => mediaNeedsSound(media) && (!media.paused || media.autoplay));
+    if (mutedPlayback) ensureSoundButton();
+    else if (performance.now() > soundRecoveryUntil) hideSoundButton();
+  }
+
+  let mediaInspectionScheduled = false;
+  function scheduleMediaInspection() {
+    if (mediaInspectionScheduled) return;
+    mediaInspectionScheduled = true;
+    requestAnimationFrame(() => {
+      mediaInspectionScheduled = false;
+      inspectMediaSound();
+    });
+  }
+
+  function looksLikeSoundControl(target) {
+    if (!(target instanceof Element)) return false;
+    const control = target.closest("button,[role='button'],a,label,[aria-label],[title]") || target;
+    const text = [control.textContent, control.getAttribute("aria-label"), control.getAttribute("title")]
+      .filter(Boolean).join(" ").toLowerCase();
+    return /unmute|enable sound|sound on|turn on sound|tap for sound|listen|volume/.test(text);
+  }
+
+  ["play", "playing", "loadedmetadata", "volumechange", "emptied"].forEach(type => {
+    document.addEventListener(type, scheduleMediaInspection, true);
+  });
+
+  document.addEventListener("pointerup", event => {
+    if (!event.isTrusted) return;
+    resumeTrackedAudioContexts();
+    const mediaTarget = event.target instanceof Element ? event.target.closest("audio,video") : null;
+    if (mediaTarget || looksLikeSoundControl(event.target)) requestSoundRecovery();
+  }, true);
+  document.addEventListener("touchend", event => {
+    if (!event.isTrusted) return;
+    resumeTrackedAudioContexts();
+    if (looksLikeSoundControl(event.target)) requestSoundRecovery();
+  }, true);
+  document.addEventListener("keydown", event => {
+    if (!event.isTrusted) return;
+    resumeTrackedAudioContexts();
+    if (["Enter", " ", "SoftLeft", "SoftRight"].includes(event.key) && looksLikeSoundControl(event.target)) {
+      requestSoundRecovery();
+    }
+  }, true);
+
+  const mutedDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "muted");
+  if (mutedDescriptor && mutedDescriptor.configurable && mutedDescriptor.get && mutedDescriptor.set) {
+    Object.defineProperty(HTMLMediaElement.prototype, "muted", {
+      configurable: mutedDescriptor.configurable,
+      enumerable: mutedDescriptor.enumerable,
+      get() { return mutedDescriptor.get.call(this); },
+      set(value) {
+        const forceAudible = performance.now() <= soundRecoveryUntil;
+        mutedDescriptor.set.call(this, forceAudible && value ? false : value);
+      }
+    });
+  }
+  const volumeDescriptor = Object.getOwnPropertyDescriptor(HTMLMediaElement.prototype, "volume");
+  if (volumeDescriptor && volumeDescriptor.configurable && volumeDescriptor.get && volumeDescriptor.set) {
+    Object.defineProperty(HTMLMediaElement.prototype, "volume", {
+      configurable: volumeDescriptor.configurable,
+      enumerable: volumeDescriptor.enumerable,
+      get() { return volumeDescriptor.get.call(this); },
+      set(value) {
+        const forceAudible = performance.now() <= soundRecoveryUntil;
+        const numeric = Number(value);
+        volumeDescriptor.set.call(this, forceAudible && numeric <= 0.001 ? 1 : value);
+      }
+    });
+  }
+
+  const mediaObserver = new MutationObserver(() => {
+    if (performance.now() <= soundRecoveryUntil) forceMediaSound();
+    scheduleMediaInspection();
+  });
+  const observeMediaRoot = () => {
+    const root = document.documentElement;
+    if (!root) return requestAnimationFrame(observeMediaRoot);
+    mediaObserver.observe(root, { subtree: true, childList: true, attributes: true, attributeFilter: ["muted", "autoplay", "src"] });
+    inspectMediaSound();
+  };
+  observeMediaRoot();
 
   if (!("mozAudioChannelType" in HTMLMediaElement.prototype)) {
     Object.defineProperty(HTMLMediaElement.prototype, "mozAudioChannelType", {
@@ -469,9 +627,6 @@
     value: audioChannelManager
   });
 
-  // ---------------------------------------------------------------------------
-  // System messages + wake locks
-  // ---------------------------------------------------------------------------
   const systemMessageHandlers = new Map();
   Object.defineProperty(navigator, "mozSetMessageHandler", {
     configurable: true,
@@ -507,9 +662,6 @@
     Object.defineProperty(navigator, "mozRequestWakeLock", { configurable: true, value: requestWakeLock });
   }
 
-  // ---------------------------------------------------------------------------
-  // Native bridge (API calls)
-  // ---------------------------------------------------------------------------
   function request(api, args) {
     const callbackId = `kai-${Date.now()}-${++sequence}`;
     return new Promise((resolve, reject) => {
@@ -541,79 +693,20 @@
     else callback.reject(new Error(response.error || "Kai Runtime API request failed"));
   });
 
-  // Runtime info / network control from Android
-  document.addEventListener("kai-runtime-info", event => {
-    const detail = event.detail || {};
-    if (typeof detail.networkEnabled === "boolean") networkEnabled = detail.networkEnabled;
-    if (detail.privileged) privilegedHint = true;
-  });
-  document.addEventListener("kai-network-control", event => {
-    const detail = event.detail || {};
-    if (typeof detail.enabled === "boolean") {
-      networkEnabled = detail.enabled;
-      window.dispatchEvent(new Event(networkEnabled ? "online" : "offline"));
-    }
-  });
-
-  // ---------------------------------------------------------------------------
-  // Key events with KaiOS keyCode values (softkeys, call, etc.)
-  // ---------------------------------------------------------------------------
-  // KaiOS softkey codes: primary SoftLeft/SoftRight are 37/39 (same as arrows);
-  // apps distinguish via event.key. Some devices also emit 403/404.
-  const KEY_CODES = {
-    SoftLeft: 37,
-    SoftRight: 39,
-    Enter: 13,
-    ArrowUp: 38,
-    ArrowDown: 40,
-    ArrowLeft: 37,
-    ArrowRight: 39,
-    Backspace: 8,
-    Call: 419,
-    EndCall: 420,
-    "*": 170,
-    "#": 163
-  };
-
   document.addEventListener("kai-key", event => {
     const detail = event.detail || {};
-    const key = detail.key || "";
-    const keyCode = typeof detail.keyCode === "number" ? detail.keyCode : (KEY_CODES[key] || (key.length === 1 ? key.charCodeAt(0) : 0));
+    if (detail.dispatchedByContent) return;
     const target = document.activeElement || document.body || document.documentElement;
-    const type = detail.phase === "up" ? "keyup" : "keydown";
-    const init = {
-      key,
-      code: key.length === 1 ? `Key${key.toUpperCase()}` : key,
-      keyCode,
-      which: keyCode,
+    if (!target) return;
+    target.dispatchEvent(new KeyboardEvent(detail.phase === "up" ? "keyup" : "keydown", {
+      key: detail.key,
       bubbles: true,
       cancelable: true,
       repeat: Boolean(detail.repeat),
       composed: true
-    };
-    // KeyboardEvent constructor ignores keyCode in modern Gecko; define after.
-    const keyboardEvent = new KeyboardEvent(type, init);
-    try {
-      Object.defineProperty(keyboardEvent, "keyCode", { get: () => keyCode });
-      Object.defineProperty(keyboardEvent, "which", { get: () => keyCode });
-      Object.defineProperty(keyboardEvent, "charCode", { get: () => 0 });
-    } catch (_) { /* read-only on some builds */ }
-
-    const cancelled = !target.dispatchEvent(keyboardEvent);
-    // Also fire on window/document for apps that listen there.
-    if (!cancelled) {
-      window.dispatchEvent(keyboardEvent);
-    }
-
-    // SoftLeft / SoftRight often double as lsk/rsk custom events in KaiUI apps.
-    if (type === "keydown" && (key === "SoftLeft" || key === "SoftRight")) {
-      window.dispatchEvent(new CustomEvent(key === "SoftLeft" ? "lsk" : "rsk", { bubbles: true }));
-    }
+    }));
   });
 
-  // ---------------------------------------------------------------------------
-  // Console / error forwarding
-  // ---------------------------------------------------------------------------
   function logToAndroid(payload) {
     document.dispatchEvent(new CustomEvent("kai-runtime-log", { detail: payload }));
   }
@@ -677,9 +770,6 @@
     logToAndroid({ type: "focus", element });
   });
 
-  // ---------------------------------------------------------------------------
-  // KaiRuntime surface
-  // ---------------------------------------------------------------------------
   const runtime = {
     version: "0.3.0",
     profile: "kaios-2.5",
@@ -692,10 +782,13 @@
       notifications: true,
       deviceStorage: true,
       systemXHR: true,
-      tcpSocket: true,
       audioChannel: true,
       systemMessages: true,
-      contacts: false,
+      contacts: true,
+      alarms: true,
+      settings: true,
+      activities: true,
+      gamepad: true,
       telephony: false,
       sms: false
     }),
@@ -703,59 +796,13 @@
     getNetwork: () => request("network"),
     vibrate: duration => request("vibrate", { duration }),
     getLocation: () => request("location"),
-    showNotification: (title, body) => request("notification", { title, body }),
-    getCapabilities: () => request("capabilities")
+    showNotification: (title, body) => request("notification", { title, body })
   };
 
   Object.freeze(runtime);
   Object.defineProperty(window, "KaiRuntime", { value: runtime, enumerable: true });
   Object.defineProperty(navigator, "kaiRuntime", { value: runtime, enumerable: true });
 
-  // ---------------------------------------------------------------------------
-  // Battery Status API
-  // ---------------------------------------------------------------------------
-  if (typeof navigator.getBattery !== "function") {
-    const batteryManager = new EventTarget();
-    let batteryLevel = 1;
-    let batteryCharging = true;
-    Object.defineProperties(batteryManager, {
-      charging: { enumerable: true, get: () => batteryCharging },
-      chargingTime: { enumerable: true, get: () => (batteryCharging ? 0 : Infinity) },
-      dischargingTime: { enumerable: true, get: () => (batteryCharging ? Infinity : 7200) },
-      level: { enumerable: true, get: () => batteryLevel },
-      onchargingchange: { configurable: true, writable: true, value: null },
-      onlevelchange: { configurable: true, writable: true, value: null }
-    });
-    Object.defineProperty(navigator, "getBattery", {
-      configurable: true,
-      value() {
-        return request("battery").then(data => {
-          if (data && typeof data.level === "number") {
-            batteryLevel = Math.max(0, Math.min(1, data.level));
-          }
-          if (data && typeof data.charging === "boolean") batteryCharging = data.charging;
-          return batteryManager;
-        }).catch(() => batteryManager);
-      }
-    });
-    if (!("battery" in navigator)) {
-      Object.defineProperty(navigator, "battery", { configurable: true, get: () => batteryManager });
-    }
-    if (!("mozBattery" in navigator)) {
-      Object.defineProperty(navigator, "mozBattery", { configurable: true, get: () => batteryManager });
-    }
-  }
-
-  if (typeof navigator.mozVibrate !== "function" && typeof navigator.vibrate === "function") {
-    Object.defineProperty(navigator, "mozVibrate", {
-      configurable: true,
-      value: (...args) => navigator.vibrate(...args)
-    });
-  }
-
-  // ---------------------------------------------------------------------------
-  // Device Storage (IndexedDB-backed)
-  // ---------------------------------------------------------------------------
   const storageDb = new Promise((resolve, reject) => {
     const open = indexedDB.open("kai-device-storage", 1);
     open.onupgradeneeded = () => open.result.createObjectStore("files", { keyPath: "name" });
@@ -763,32 +810,28 @@
     open.onerror = () => reject(open.error);
   });
 
+  class CompatibleDOMRequest extends EventTarget {
+    constructor() {
+      super();
+      this.result = null;
+      this.error = null;
+      this.readyState = "pending";
+    }
+  }
+  defineEventHandlerProperties(CompatibleDOMRequest.prototype, ["success", "error"]);
+
   function domRequest(operation) {
-    const listeners = { success: [], error: [] };
-    const result = {
-      result: null,
-      error: null,
-      readyState: "pending",
-      onsuccess: null,
-      onerror: null,
-      addEventListener(type, listener) {
-        if (listeners[type]) listeners[type].push(listener);
-      }
-    };
+    const request = new CompatibleDOMRequest();
     Promise.resolve().then(operation).then(value => {
-      result.result = value;
-      result.readyState = "done";
-      const event = { target: result };
-      if (typeof result.onsuccess === "function") result.onsuccess(event);
-      listeners.success.forEach(listener => listener(event));
+      request.result = value;
+      request.readyState = "done";
+      request.dispatchEvent(new Event("success"));
     }, error => {
-      result.error = error instanceof Error ? error : new Error(String(error));
-      result.readyState = "done";
-      const event = { target: result };
-      if (typeof result.onerror === "function") result.onerror(event);
-      listeners.error.forEach(listener => listener(event));
+      request.error = error instanceof Error ? error : new Error(String(error));
+      request.readyState = "done";
+      request.dispatchEvent(new Event("error"));
     });
-    return result;
+    return request;
   }
 
   async function withStore(mode, operation) {
@@ -798,6 +841,7 @@
       const request = operation(transaction.objectStore("files"));
       request.onsuccess = () => resolve(request.result);
       request.onerror = () => reject(request.error);
+      transaction.onabort = () => reject(transaction.error || new Error("Device storage transaction aborted"));
     });
   }
 
@@ -809,89 +853,349 @@
   }
 
   function enumerate(prefix) {
-    const listeners = { success: [], error: [] };
+    const cursor = new CompatibleDOMRequest();
     let records = [];
     let index = 0;
-    const cursor = {
-      result: null,
-      error: null,
-      readyState: "pending",
-      onsuccess: null,
-      onerror: null,
-      addEventListener(type, listener) {
-        if (listeners[type]) listeners[type].push(listener);
-      },
-      continue() {
-        emit();
-      }
-    };
-    function notify(type) {
-      const event = { target: cursor };
-      const handler = cursor[`on${type}`];
-      if (typeof handler === "function") handler(event);
-      listeners[type].forEach(listener => listener(event));
-    }
+    let dispatchQueued = false;
+    let recordsReady = false;
+    cursor.done = false;
+
     function emit() {
+      if (!recordsReady || dispatchQueued || cursor.done) return;
+      dispatchQueued = true;
+      cursor.readyState = "pending";
       queueMicrotask(() => {
-        cursor.result = index < records.length ? asFile(records[index++]) : null;
+        dispatchQueued = false;
+        if (index < records.length) {
+          cursor.result = asFile(records[index++]);
+          cursor.done = false;
+        } else {
+          cursor.result = null;
+          cursor.done = true;
+        }
         cursor.readyState = "done";
-        notify("success");
+        cursor.dispatchEvent(new Event("success"));
       });
     }
+
+    cursor.continue = () => {
+      if (!cursor.done) emit();
+    };
+
     withStore("readonly", store => store.getAll()).then(all => {
       records = all.filter(record => !prefix || record.name.startsWith(prefix));
+      recordsReady = true;
       emit();
     }, error => {
-      cursor.error = error;
+      cursor.error = error instanceof Error ? error : new Error(String(error));
+      cursor.done = true;
       cursor.readyState = "done";
-      notify("error");
+      cursor.dispatchEvent(new Event("error"));
     });
     return cursor;
   }
 
-  function createDeviceStorage(storageName) {
-    return {
-      storageName,
-      default: true,
-      available: () => domRequest(() => "available"),
-      freeSpace: () => domRequest(async () => {
+  class CompatibleDeviceStorage extends EventTarget {
+    constructor(storageName) {
+      super();
+      this.storageName = storageName;
+      this.default = true;
+      this.isRemovable = false;
+      this.canBeMounted = false;
+    }
+
+    _change(reason, path) {
+      const event = new Event("change");
+      Object.defineProperties(event, {
+        reason: { enumerable: true, value: reason },
+        path: { enumerable: true, value: path }
+      });
+      this.dispatchEvent(event);
+    }
+
+    available() { return domRequest(() => "available"); }
+    storageStatus() { return this.available(); }
+
+    freeSpace() {
+      return domRequest(async () => {
         const records = await withStore("readonly", store => store.getAll());
         const used = records.reduce((total, record) => total + (record.data.size || 0), 0);
         return Math.max(0, 50 * 1024 * 1024 - used);
-      }),
-      usedSpace: () => domRequest(async () => {
+      });
+    }
+
+    usedSpace() {
+      return domRequest(async () => {
         const records = await withStore("readonly", store => store.getAll());
         return records.reduce((total, record) => total + (record.data.size || 0), 0);
-      }),
-      get: name => domRequest(async () => {
-        const record = await withStore("readonly", store => store.get(String(name)));
-        if (!record) throw new Error(`File not found: ${name}`);
+      });
+    }
+
+    get(name) {
+      return domRequest(async () => {
+        const normalized = String(name).replace(/^\/+/, "");
+        const record = await withStore("readonly", store => store.get(normalized));
+        if (!record) throw new DOMException(`File not found: ${normalized}`, "NotFoundError");
         return asFile(record);
-      }),
-      add: blob => {
-        const name = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
-        return domRequest(async () => {
-          await withStore("readwrite", store => store.put({
-            name, data: blob, type: blob.type, lastModified: Date.now()
-          }));
-          return name;
-        });
-      },
-      addNamed: (blob, name) => domRequest(async () => {
+      });
+    }
+
+    getEditable(name) { return this.get(name); }
+
+    add(blob) {
+      const name = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      return this.addNamed(blob, name);
+    }
+
+    addNamed(blob, name) {
+      return domRequest(async () => {
         const safeName = String(name).replace(/^\/+/, "");
-        if (!safeName || safeName.split("/").includes("..")) throw new Error("Invalid storage path");
+        if (!safeName || safeName.split("/").includes("..")) throw new DOMException("Invalid storage path", "InvalidModificationError");
         await withStore("readwrite", store => store.put({
-          name: safeName, data: blob, type: blob.type, lastModified: Date.now()
+          name: safeName, data: blob, type: blob && blob.type, lastModified: Date.now()
         }));
+        this._change("created", safeName);
         return safeName;
-      }),
-      delete: name => domRequest(async () => {
-        await withStore("readwrite", store => store.delete(String(name).replace(/^\/+/, "")));
-        return String(name);
-      }),
-      enumerate: prefix => enumerate(prefix ? String(prefix).replace(/^\/+/, "") : "")
+      });
+    }
+
+    delete(name) {
+      return domRequest(async () => {
+        const safeName = String(name).replace(/^\/+/, "");
+        await withStore("readwrite", store => store.delete(safeName));
+        this._change("deleted", safeName);
+        return safeName;
+      });
+    }
+
+    enumerate(prefix) {
+      return enumerate(prefix ? String(prefix).replace(/^\/+/, "") : "");
+    }
+
+    enumerateEditable(prefix) { return this.enumerate(prefix); }
+  }
+  defineEventHandlerProperties(CompatibleDeviceStorage.prototype, ["change"]);
+
+  function createDeviceStorage(storageName) {
+    return new CompatibleDeviceStorage(storageName);
+  }
+
+
+  // A virtual standard gamepad lets HTML5 games use the KaiOS D-pad and keypad
+  // without requiring a physical Android controller.
+  const gamepadButtons = Array.from({ length: 17 }, () => ({ pressed: false, touched: false, value: 0 }));
+  const virtualGamepad = {
+    id: "Kai Runtime Virtual Keypad",
+    index: 0,
+    connected: true,
+    mapping: "standard",
+    timestamp: performance.now(),
+    axes: [0, 0, 0, 0],
+    buttons: gamepadButtons,
+    vibrationActuator: null
+  };
+  function updateGamepad(key, pressed) {
+    const buttonMap = { Enter: 0, SoftRight: 1, Backspace: 1, SoftLeft: 8, EndCall: 9, "*": 4, "#": 5 };
+    if (Object.prototype.hasOwnProperty.call(buttonMap, key)) {
+      const button = gamepadButtons[buttonMap[key]];
+      button.pressed = pressed;
+      button.touched = pressed;
+      button.value = pressed ? 1 : 0;
+    }
+    if (key === "ArrowLeft") virtualGamepad.axes[0] = pressed ? -1 : (virtualGamepad.axes[0] < 0 ? 0 : virtualGamepad.axes[0]);
+    if (key === "ArrowRight") virtualGamepad.axes[0] = pressed ? 1 : (virtualGamepad.axes[0] > 0 ? 0 : virtualGamepad.axes[0]);
+    if (key === "ArrowUp") virtualGamepad.axes[1] = pressed ? -1 : (virtualGamepad.axes[1] < 0 ? 0 : virtualGamepad.axes[1]);
+    if (key === "ArrowDown") virtualGamepad.axes[1] = pressed ? 1 : (virtualGamepad.axes[1] > 0 ? 0 : virtualGamepad.axes[1]);
+    virtualGamepad.timestamp = performance.now();
+  }
+  document.addEventListener("kai-key", event => {
+    const detail = event.detail || {};
+    updateGamepad(detail.key, detail.phase !== "up");
+  });
+  if (!navigator.getGamepads) {
+    Object.defineProperty(navigator, "getGamepads", { configurable: true, value: () => [virtualGamepad, null, null, null] });
+  }
+  queueMicrotask(() => {
+    try { window.dispatchEvent(new GamepadEvent("gamepadconnected", { gamepad: virtualGamepad })); } catch (_) {}
+  });
+
+  const contactsDb = new Promise((resolve, reject) => {
+    const open = indexedDB.open("kai-contacts", 1);
+    open.onupgradeneeded = () => open.result.createObjectStore("contacts", { keyPath: "id" });
+    open.onsuccess = () => resolve(open.result);
+    open.onerror = () => reject(open.error);
+  });
+  function withContacts(mode, operation) {
+    return contactsDb.then(db => new Promise((resolve, reject) => {
+      const request = operation(db.transaction("contacts", mode).objectStore("contacts"));
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    }));
+  }
+  function MozContact(properties) {
+    Object.assign(this, properties || {});
+    if (!this.id) this.id = `contact-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  Object.defineProperty(window, "mozContact", { configurable: true, value: MozContact });
+  Object.defineProperty(window, "MozContact", { configurable: true, value: MozContact });
+  const mozContacts = {
+    find(options) {
+      return domRequest(async () => {
+        const all = await withContacts("readonly", store => store.getAll());
+        const query = String(options && options.filterValue || "").toLowerCase();
+        if (!query) return all;
+        const fields = options && options.filterBy || ["name", "givenName", "familyName", "tel", "email"];
+        return all.filter(contact => fields.some(field => {
+          const value = contact[field];
+          return JSON.stringify(value == null ? "" : value).toLowerCase().includes(query);
+        }));
+      });
+    },
+    save(contact) {
+      return domRequest(async () => {
+        const normalized = JSON.parse(JSON.stringify(contact || {}));
+        if (!normalized.id) normalized.id = `contact-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        await withContacts("readwrite", store => store.put(normalized));
+        Object.assign(contact, normalized);
+        return contact;
+      });
+    },
+    remove(contact) {
+      return domRequest(async () => {
+        const id = typeof contact === "string" ? contact : contact && contact.id;
+        if (!id) throw new Error("Contact id is required");
+        await withContacts("readwrite", store => store.delete(id));
+        return null;
+      });
+    },
+    clear() {
+      return domRequest(async () => { await withContacts("readwrite", store => store.clear()); return null; });
+    },
+    getAll() { return this.find({}); }
+  };
+  if (!navigator.mozContacts) Object.defineProperty(navigator, "mozContacts", { configurable: true, value: mozContacts });
+
+  let alarmSequence = 0;
+  const alarms = new Map();
+  const mozAlarms = {
+    add(date, respectTimezone, data) {
+      return domRequest(() => {
+        const id = ++alarmSequence;
+        const when = new Date(date).getTime();
+        const alarm = { id, date: new Date(when), respectTimezone: String(respectTimezone || "ignoreTimezone"), data };
+        const delay = Math.max(0, when - Date.now());
+        alarm.timer = setTimeout(() => {
+          alarms.delete(id);
+          const handler = systemMessageHandlers.get("alarm");
+          if (handler) handler({ id, date: alarm.date, data: alarm.data });
+          window.dispatchEvent(new CustomEvent("kai-system-message", { detail: { type: "alarm", data: alarm } }));
+        }, Math.min(delay, 0x7fffffff));
+        alarms.set(id, alarm);
+        return id;
+      });
+    },
+    remove(id) {
+      const alarm = alarms.get(Number(id));
+      if (alarm) clearTimeout(alarm.timer);
+      alarms.delete(Number(id));
+    },
+    getAll() {
+      return domRequest(() => Array.from(alarms.values()).map(({ timer, ...alarm }) => alarm));
+    }
+  };
+  if (!navigator.mozAlarms) Object.defineProperty(navigator, "mozAlarms", { configurable: true, value: mozAlarms });
+
+  const settingsValues = new Map();
+  const settingsObservers = new Map();
+  const mozSettings = {
+    createLock() {
+      return {
+        get(name) { return domRequest(() => ({ [name]: settingsValues.get(name) })); },
+        set(values) {
+          return domRequest(() => {
+            Object.entries(values || {}).forEach(([name, value]) => {
+              settingsValues.set(name, value);
+              (settingsObservers.get(name) || []).forEach(callback => callback({ settingName: name, settingValue: value }));
+            });
+            return null;
+          });
+        }
+      };
+    },
+    addObserver(name, callback) {
+      if (!settingsObservers.has(name)) settingsObservers.set(name, []);
+      settingsObservers.get(name).push(callback);
+    },
+    removeObserver(name, callback) {
+      const list = settingsObservers.get(name) || [];
+      const index = list.indexOf(callback);
+      if (index >= 0) list.splice(index, 1);
+    }
+  };
+  if (!navigator.mozSettings) Object.defineProperty(navigator, "mozSettings", { configurable: true, value: mozSettings });
+
+  if (!navigator.mozL10n) {
+    Object.defineProperty(navigator, "mozL10n", {
+      configurable: true,
+      value: {
+        get: (id, args) => String(id).replace(/\{\{\s*([^}]+)\s*\}\}/g, (_, key) => args && key in args ? args[key] : ""),
+        once: callback => queueMicrotask(callback),
+        ready: callback => queueMicrotask(callback),
+        language: { code: navigator.language || "en-US", direction: "ltr" },
+        translate: () => undefined
+      }
+    });
+  }
+
+  if (!screen.mozLockOrientation) {
+    screen.mozLockOrientation = orientation => {
+      try {
+        const value = Array.isArray(orientation) ? orientation[0] : orientation;
+        if (screen.orientation && screen.orientation.lock) screen.orientation.lock(value).catch(() => {});
+        return true;
+      } catch (_) { return false; }
     };
   }
+  if (!screen.mozUnlockOrientation) {
+    screen.mozUnlockOrientation = () => {
+      try { if (screen.orientation && screen.orientation.unlock) screen.orientation.unlock(); } catch (_) {}
+    };
+  }
+
+  function MozActivity(options) {
+    this.source = options || {};
+    this.result = null;
+    this.error = null;
+    this.onsuccess = null;
+    this.onerror = null;
+    queueMicrotask(async () => {
+      try {
+        const name = this.source.name;
+        const data = this.source.data || {};
+        if ((name === "view" || name === "open") && (data.url || data.uri)) {
+          location.href = new URL(data.url || data.uri, location.href).href;
+          this.result = true;
+        } else if (name === "share" && navigator.share) {
+          await navigator.share({ title: data.title, text: data.text, url: data.url });
+          this.result = true;
+        } else {
+          this.result = data;
+        }
+        if (typeof this.onsuccess === "function") this.onsuccess({ target: this });
+      } catch (error) {
+        this.error = error;
+        if (typeof this.onerror === "function") this.onerror({ target: this });
+      }
+    });
+  }
+  if (!window.MozActivity) Object.defineProperty(window, "MozActivity", { configurable: true, value: MozActivity });
+
+  const nativeWindowOpen = window.open.bind(window);
+  window.open = function (url, target, features) {
+    const opened = nativeWindowOpen(url, target, features);
+    if (opened || !url) return opened;
+    try { location.href = new URL(url, location.href).href; return window; } catch (_) { return null; }
+  };
 
   const deviceStores = new Map();
   Object.defineProperty(navigator, "getDeviceStorage", {
@@ -907,18 +1211,15 @@
     value(type) { return [navigator.getDeviceStorage(type)]; }
   });
 
-  // ---------------------------------------------------------------------------
-  // Connection / mobile connection
-  // ---------------------------------------------------------------------------
   const connectionInfo = new EventTarget();
   Object.defineProperties(connectionInfo, {
-    type: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? "wifi" : "none") },
-    effectiveType: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? "4g" : "slow-2g") },
-    downlink: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? 10 : 0) },
-    rtt: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? 50 : 0) },
+    type: { enumerable: true, get: () => navigator.onLine ? "wifi" : "none" },
+    effectiveType: { enumerable: true, get: () => navigator.onLine ? "4g" : "slow-2g" },
+    downlink: { enumerable: true, get: () => navigator.onLine ? 10 : 0 },
+    rtt: { enumerable: true, get: () => navigator.onLine ? 50 : 0 },
     saveData: { enumerable: true, value: false },
     metered: { enumerable: true, value: false },
-    bandwidth: { enumerable: true, get: () => (networkEnabled && navigator.onLine ? 10 : 0) }
+    bandwidth: { enumerable: true, get: () => navigator.onLine ? 10 : 0 }
   });
   if (!navigator.connection) {
     Object.defineProperty(navigator, "connection", { configurable: true, value: connectionInfo });
@@ -938,10 +1239,10 @@
     data: {
       enumerable: true,
       get: () => ({
-        connected: networkEnabled && navigator.onLine,
+        connected: navigator.onLine,
         roaming: false,
         network: null,
-        type: networkEnabled && navigator.onLine ? "wifi" : null
+        type: navigator.onLine ? "wifi" : null
       })
     }
   });
@@ -950,17 +1251,11 @@
   if (!navigator.mozMobileConnections) {
     Object.defineProperty(navigator, "mozMobileConnections", { configurable: true, value: [mobileConnection] });
   }
-  if (!navigator.mozMobileConnection) {
-    Object.defineProperty(navigator, "mozMobileConnection", { configurable: true, value: mobileConnection });
-  }
 
-  // ---------------------------------------------------------------------------
-  // mozApps
-  // ---------------------------------------------------------------------------
   async function currentApplication() {
     let manifest = { name: document.title || "KaiOS App", type: "web", permissions: {} };
     try {
-      const response = await nativeFetch("/manifest.webapp", { cache: "no-store" });
+      const response = await fetch("/manifest.webapp");
       if (response.ok) manifest = await response.json();
     } catch (_) {
       // The generic manifest keeps legacy app-detection code operational.
@@ -986,37 +1281,4 @@
     configurable: true,
     value: mozApps
   });
-
-  // ---------------------------------------------------------------------------
-  // navigator.b2g (KaiOS 3.x)
-  // ---------------------------------------------------------------------------
-  if (!navigator.b2g) {
-    const b2g = {};
-    const mirror = (target, key, value) => {
-      if (value === undefined) return;
-      try {
-        Object.defineProperty(target, key, { configurable: true, enumerable: true, value });
-      } catch (_) { /* read-only host property */ }
-    };
-    mirror(b2g, "getDeviceStorage", navigator.getDeviceStorage && navigator.getDeviceStorage.bind(navigator));
-    mirror(b2g, "getDeviceStorages", navigator.getDeviceStorages && navigator.getDeviceStorages.bind(navigator));
-    mirror(b2g, "mozApps", navigator.mozApps);
-    mirror(b2g, "b2gApps", navigator.mozApps);
-    mirror(b2g, "mozMobileConnections", navigator.mozMobileConnections);
-    mirror(b2g, "connection", navigator.connection);
-    mirror(b2g, "getBattery", navigator.getBattery && navigator.getBattery.bind(navigator));
-    mirror(b2g, "vibrate", navigator.vibrate && navigator.vibrate.bind(navigator));
-    mirror(b2g, "setMessageHandler", navigator.mozSetMessageHandler && navigator.mozSetMessageHandler.bind(navigator));
-    mirror(b2g, "requestWakeLock", navigator.requestWakeLock && navigator.requestWakeLock.bind(navigator));
-    mirror(b2g, "TCPSocket", mozTCPSocket);
-    Object.defineProperty(navigator, "b2g", { configurable: true, value: b2g });
-  }
-
-  // Advertise online status for apps that check navigator.onLine at boot.
-  try {
-    Object.defineProperty(navigator, "onLine", {
-      configurable: true,
-      get: () => networkEnabled && true
-    });
-  } catch (_) { /* some engines lock onLine */ }
 })();
