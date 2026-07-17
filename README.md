@@ -4,8 +4,10 @@ Kai Runtime is an Android compatibility shell for packaged KaiOS/Firefox OS web 
 
 It is **not** a full KaiOS firmware emulator. Apps that depend on proprietary system services, carrier APIs, DRM, certified-only APIs, or exact device firmware behavior can still require app-specific work.
 
-## Version 0.3.5 improvements
+## Version 0.3.6 improvements
 
+- Opens the native GeckoView messaging bridge only in the top-level app frame, eliminating rejected iframe ports and the repeated `EventDispatcher is only available in the parent process` error
+- Keeps compatibility injection in media and sign-in frames while returning immediate, explicit errors for privileged child-frame requests instead of letting them time out
 - Automatically hides the runtime toolbar after 3.2 seconds to expose more of the running app
 - Restores the toolbar by tapping near the top edge of the app
 - Replaces the two permanent bottom buttons with a compact collapsible side handle

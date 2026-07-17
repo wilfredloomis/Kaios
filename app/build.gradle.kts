@@ -11,8 +11,8 @@ android {
         applicationId = "com.example.kairuntime"
         minSdk = 26
         targetSdk = 35
-        versionCode = 11
-        versionName = "0.3.5"
+        versionCode = 12
+        versionName = "0.3.6"
 
         ndk {
             abiFilters += setOf("armeabi-v7a", "arm64-v8a")

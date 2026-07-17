@@ -5,7 +5,9 @@ import assert from 'node:assert/strict';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const runtimePath = path.join(root, 'app/src/main/assets/extensions/kai-runtime/page-runtime.js');
+const contentPath = path.join(root, 'app/src/main/assets/extensions/kai-runtime/content.js');
 const source = fs.readFileSync(runtimePath, 'utf8');
+const contentSource = fs.readFileSync(contentPath, 'utf8');
 
 function extractDeclaration(token) {
   const start = source.indexOf(token);
@@ -153,4 +155,14 @@ compatibleHls.loadLevel('https://example.invalid/live.m3u8');
 assert.equal(nativeHls.source, 'https://example.invalid/live.m3u8');
 assert.equal(nativeHls.started, 2);
 
-console.log('Kai Runtime 0.3.3 compatibility smoke tests passed');
+// Native GeckoView messaging is valid only for the top-level content context.
+// Verify the frame guard remains before connectNative so embedded players and
+// sign-in iframes cannot recreate the parent-process EventDispatcher error.
+const frameGuard = contentSource.indexOf('if (!isTopLevel)');
+const nativeConnect = contentSource.indexOf('browser.runtime.connectNative("kaiRuntime")');
+assert.ok(frameGuard >= 0, 'Missing child-frame native messaging guard');
+assert.ok(nativeConnect > frameGuard, 'Native messaging must connect only after the child-frame guard');
+assert.match(contentSource, /Native KaiOS APIs are only available in the top-level app frame/);
+assert.match(contentSource, /Privileged network access is only available in the top-level app frame/);
+
+console.log('Kai Runtime 0.3.6 compatibility smoke tests passed');

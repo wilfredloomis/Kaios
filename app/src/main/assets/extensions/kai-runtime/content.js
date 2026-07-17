@@ -1,8 +1,9 @@
 (function () {
   "use strict";
 
-  const port = browser.runtime.connectNative("kaiRuntime");
-  let connected = true;
+  const isTopLevel = window === window.top;
+  let port = null;
+  let connected = false;
   let trustKnown = false;
   let trustedAppOrigin = false;
   const queuedNetworkRequests = [];
@@ -22,6 +23,37 @@
       : detail;
     document.dispatchEvent(new CustomEvent(type, { detail: safeDetail }));
   }
+
+  // GeckoView's native messaging dispatcher only exists in the parent/top-level
+  // content context. Connecting from every media and sign-in iframe causes Gecko
+  // to report "EventDispatcher is only available in the parent process" and
+  // creates ports that Android must immediately reject. Child frames still get
+  // the page compatibility layer, but fail privileged requests immediately.
+  if (!isTopLevel) {
+    document.addEventListener("kai-api-request", event => {
+      const detail = event.detail || {};
+      if (typeof detail.callbackId !== "string") return;
+      dispatchToPage("kai-api-response", {
+        callbackId: detail.callbackId,
+        success: false,
+        error: "Native KaiOS APIs are only available in the top-level app frame"
+      });
+    });
+    document.addEventListener("kai-network-request", event => {
+      const detail = event.detail || {};
+      if (typeof detail.id !== "string") return;
+      dispatchToPage("kai-network-response", {
+        id: detail.id,
+        success: false,
+        error: "Privileged network access is only available in the top-level app frame"
+      });
+    });
+    injectRuntime();
+    return;
+  }
+
+  port = browser.runtime.connectNative("kaiRuntime");
+  connected = true;
 
   function keyMetadata(key) {
     const codes = {
